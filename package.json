@@ -1,1 +1,1 @@
-{"name":"fieldlab","private":true,"type":"module","scripts":{"test":"node --test","dev":"node server.mjs"}}
+{"name":"fieldlab","private":true,"license":"GPL-2.0-or-later","type":"module","scripts":{"test":"node --test","dev":"node server.mjs"}}

@@ -4,15 +4,39 @@ Browser-local antenna exploration and NEC2++ modeling, with 15 antenna presets a
 
 ## GitHub Pages
 
-Live app: https://supergoldfish101.github.io/FieldLab/
+Live app: https://fieldlab.ve6kix.com/
 
 Source: https://github.com/Supergoldfish101/FieldLab
 
-The `Publish FieldLab` workflow tests and publishes the checked-in `dist/` directory on pushes to `main`, or when started manually. Pages uses GitHub Actions as its publishing source. No runtime server, database, account, API key or deployment secret is required. All application modules, NEC WASM files and source archives are served from the same repository path. The local `server.mjs` is only a development file server.
+The `Publish FieldLab` workflow tests and publishes the checked-in `dist/` directory on pushes to `main`, or when started manually. Pages uses GitHub Actions as its publishing source. No runtime server, database, account, API key or deployment secret is required. All application modules, NEC WASM files and source archives are served from the same repository path. The local `server.mjs` is only a development file server. The GitHub Pages address, https://supergoldfish101.github.io/FieldLab/, redirects to the custom domain.
+
+Cloudflare supplies DNS: the DNS-only CNAME `fieldlab.ve6kix.com` points to `supergoldfish101.github.io` without a repository path. The matching custom hostname is stored in this repository's Pages settings; an Actions deployment does not need a `CNAME` source file. GitHub Pages supplies HTTPS and serves the application. A NAS checkout is a development copy, not the public web server.
 
 Saved setups, preferences and installed offline apps belong to their browser origin. To move from another FieldLab address, download setup JSON there and use **Import setup** at the new address. Install the new address separately and wait for **Offline ready**. The original address's saved data and installation remain separate.
 
 Keep `LICENSE`, the vendored license notices, and both downloads in `dist/source/` when redistributing. After application changes, follow the release steps below before committing. Platform-specific hosting metadata and local credentials are excluded from this repository.
+
+## Quick start and everyday use
+
+With Node.js 24 or later and Git installed:
+
+```sh
+git clone https://github.com/Supergoldfish101/FieldLab.git
+cd FieldLab
+npm run dev
+```
+
+Open http://127.0.0.1:4186. Choose an antenna preset, set frequency and dimensions, and rotate the 3D view. Live preview responds immediately; **Accurate - NEC2** runs the local wire-current solver. **Save setup** keeps a named setup in that browser; download its JSON to back it up or use **Import setup** elsewhere. The Random wire tab provides length screening and sampled band sweeps. Pattern CSV, NEC geometry, result JSON and printable reports provide different exports; their modeling limits are described below.
+
+For offline use, open the hosted HTTPS app once, wait for **Offline ready**, then use the browser's install command if desired. No account or cloud storage is involved. Browser storage can be cleared by the user or browser, so keep exported backups.
+
+## Open-source license and contributions
+
+FieldLab's original application code is **GPL-2.0-or-later**, as declared in this project's existing licensing statement. The complete GPL v2 text is in [LICENSE](LICENSE); the "or later" choice comes from the project declaration, rather than the title of that license text. It is open source: use, study, modification and redistribution are allowed under its terms. It is not public domain. The `private` field in `package.json` prevents accidental npm publication; it does not make the GitHub repository private.
+
+The served NEC2++ engine and wrapper are also GPL-2.0-or-later; Three.js and OrbitControls retain MIT terms. Nested upstream sources keep their own notices. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for component evidence, corresponding-source downloads, build prerequisites and audit limits. Distributed modified versions must preserve applicable notices and meet the GPL's source and licensing conditions. No warranty or measured antenna-performance guarantee is provided.
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for checks, release steps and how to report numerical issues. This documentation records the existing licenses; it does not change third-party licenses or certify legal compliance.
 
 ## Calculation modes
 

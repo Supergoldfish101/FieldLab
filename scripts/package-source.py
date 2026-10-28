@@ -10,7 +10,7 @@ root = Path(__file__).resolve().parents[1]
 target = root / 'dist/source/fieldlab-source.zip'
 target.parent.mkdir(parents=True, exist_ok=True)
 with ZipFile(target, 'w', ZIP_DEFLATED, compresslevel=9) as archive:
-    for name in ['README.md', 'LICENSE', 'package.json', 'server.mjs']:
+    for name in ['README.md', 'LICENSE', 'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md', 'package.json', 'server.mjs']:
         archive.write(root / name, 'fieldlab/' + name)
     for folder in ['dist', 'scripts', 'pwa', 'tests']:
         for file in sorted((root / folder).rglob('*')):
