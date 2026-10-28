@@ -1,0 +1,1182 @@
+import { selectEvaluator, evaluationMetadata, ringReasons } from "./field-selection.js";
+import { NecConditioningError, NecGeometryError, NecInputError, NecPortError, NecRuntimeError, NecSolverError, NecStateError, } from "./errors.js";
+import { transitionModelState } from "./state-machine.js";
+import { createSymmetryExpansion, validateGeometrySymmetry, } from "./symmetry.js";
+const STATUS_OK = 0;
+const STATUS_STATE = 1;
+const STATUS_INPUT = 2;
+const STATUS_GEOMETRY = 3;
+const STATUS_PORT = 4;
+const STATUS_CONDITIONING = 5;
+const STATUS_SOLVER = 6;
+const STATUS_RUNTIME = 7;
+const INT32_MAX = 2_147_483_647;
+const FLOAT64_BYTES = Float64Array.BYTES_PER_ELEMENT;
+const INT32_BYTES = Int32Array.BYTES_PER_ELEMENT;
+const INT32_BUFFER = {
+    currentTag: 0,
+    currentSegment: 1,
+    currentNativeIndex: 2,
+    currentStartKind: 3,
+    currentStartTag: 4,
+    currentStartSegment: 5,
+    currentStartEnd: 6,
+    currentEndKind: 7,
+    currentEndTag: 8,
+    currentEndSegment: 9,
+    currentEndEnd: 10,
+};
+const PACKED_BUFFER = {
+    quadrature: 0,
+    embeddedField: 1,
+};
+const BUFFER = {
+    impedanceReal: 0,
+    impedanceImag: 1,
+    admittanceReal: 2,
+    admittanceImag: 3,
+    solutionRequestedReal: 4,
+    solutionRequestedImag: 5,
+    solutionVoltagesReal: 6,
+    solutionVoltagesImag: 7,
+    solutionCurrentsReal: 8,
+    solutionCurrentsImag: 9,
+    solutionActiveImpedancesReal: 10,
+    solutionActiveImpedancesImag: 11,
+    solutionPowersW: 12,
+    farFieldThetaDeg: 13,
+    farFieldPhiDeg: 14,
+    farFieldEThetaReal: 15,
+    farFieldEThetaImag: 16,
+    farFieldEPhiReal: 17,
+    farFieldEPhiImag: 18,
+    embeddedThetaDeg: 19,
+    embeddedPhiDeg: 20,
+    embeddedEThetaReal: 21,
+    embeddedEThetaImag: 22,
+    embeddedEPhiReal: 23,
+    embeddedEPhiImag: 24,
+    snapshotX: 25,
+    snapshotY: 26,
+    snapshotZ: 27,
+    snapshotCab: 28,
+    snapshotSab: 29,
+    snapshotSalp: 30,
+    snapshotHalfLength: 31,
+    snapshotAir: 32,
+    snapshotAii: 33,
+    snapshotBir: 34,
+    snapshotBii: 35,
+    snapshotCir: 36,
+    snapshotCii: 37,
+    currentCentres: 38,
+    currentStarts: 39,
+    currentEnds: 40,
+    currentTangents: 41,
+    currentRadii: 42,
+    currentLengths: 43,
+    currentAReal: 44,
+    currentAImag: 45,
+    currentBReal: 46,
+    currentBImag: 47,
+    currentCReal: 48,
+    currentCImag: 49,
+};
+const textDecoder = new TextDecoder();
+function inputError(message, details) {
+    throw new NecInputError(message, details === undefined ? {} : { details });
+}
+function finiteNumber(value, name) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+        inputError(`${name} must be a finite number`, { name, value });
+    }
+    return value;
+}
+function positiveNumber(value, name) {
+    const number = finiteNumber(value, name);
+    if (!(number > 0)) {
+        inputError(`${name} must be greater than zero`, { name, value });
+    }
+    return number;
+}
+function integerInRange(value, name, minimum) {
+    if (typeof value !== "number"
+        || !Number.isInteger(value)
+        || value < minimum
+        || value > INT32_MAX) {
+        inputError(`${name} must be an integer from ${minimum} through ${INT32_MAX}`, { name, value });
+    }
+    return value;
+}
+function requireRecord(value, name) {
+    if (typeof value !== "object" || value === null) {
+        inputError(`${name} must be an object`, { name });
+    }
+    return value;
+}
+function validatePoint(value, name) {
+    if (!Array.isArray(value) || value.length !== 3) {
+        inputError(`${name} must contain exactly three coordinates`, { name });
+    }
+    return [
+        finiteNumber(value[0], `${name}[0]`),
+        finiteNumber(value[1], `${name}[1]`),
+        finiteNumber(value[2], `${name}[2]`),
+    ];
+}
+function isFloat64Array(value) {
+    return Object.prototype.toString.call(value) === "[object Float64Array]";
+}
+function validateComplexVector(vector, expectedLength, name) {
+    const record = requireRecord(vector, name);
+    const real = record.real;
+    const imag = record.imag;
+    if (!isFloat64Array(real) || !isFloat64Array(imag)) {
+        inputError(`${name}.real and ${name}.imag must be Float64Array instances`);
+    }
+    if (real.length !== imag.length || real.length !== expectedLength) {
+        inputError(`${name} must contain exactly one value per port`, {
+            expectedLength,
+            realLength: real.length,
+            imagLength: imag.length,
+        });
+    }
+    for (let index = 0; index < expectedLength; index += 1) {
+        if (!Number.isFinite(real[index]) || !Number.isFinite(imag[index])) {
+            inputError(`${name} values must be finite`, { index });
+        }
+    }
+    return { real, imag };
+}
+export function validateFarFieldGrid(request, portCountForEmbedded = 1) {
+    const record = requireRecord(request, "request");
+    const theta = requireRecord(record.theta, "request.theta");
+    const phi = requireRecord(record.phi, "request.phi");
+    const radiusM = record.radiusM === undefined
+        ? 1
+        : positiveNumber(record.radiusM, "request.radiusM");
+    const thetaStartDeg = finiteNumber(theta.startDeg, "request.theta.startDeg");
+    const thetaCount = integerInRange(theta.count, "request.theta.count", 1);
+    const thetaStepDeg = finiteNumber(theta.stepDeg, "request.theta.stepDeg");
+    const phiStartDeg = finiteNumber(phi.startDeg, "request.phi.startDeg");
+    const phiCount = integerInRange(phi.count, "request.phi.count", 1);
+    const phiStepDeg = finiteNumber(phi.stepDeg, "request.phi.stepDeg");
+    const thetaEnd = thetaStartDeg + (thetaCount - 1) * thetaStepDeg;
+    const phiEnd = phiStartDeg + (phiCount - 1) * phiStepDeg;
+    if (!Number.isFinite(thetaEnd) || !Number.isFinite(phiEnd)) {
+        inputError("The requested angle sweep overflows");
+    }
+    const sampleCount = thetaCount * phiCount;
+    if (!Number.isSafeInteger(sampleCount)
+        || sampleCount > INT32_MAX
+        || sampleCount * portCountForEmbedded > INT32_MAX) {
+        inputError("The requested far-field array is too large");
+    }
+    return {
+        radiusM,
+        thetaStartDeg,
+        thetaCount,
+        thetaStepDeg,
+        phiStartDeg,
+        phiCount,
+        phiStepDeg,
+        sampleCount,
+    };
+}
+const validateGrid = validateFarFieldGrid;
+function decodeSegmentEnd(kind, tag, segment, end) {
+    if (kind === 1) {
+        return { kind: "ground" };
+    }
+    if (kind === 2) {
+        return {
+            kind: "segment",
+            tag,
+            segment,
+            end: end === 1 ? "end" : "start",
+        };
+    }
+    return { kind: "free" };
+}
+function validatePreparedQuadrature(request) {
+    const record = requireRecord(request, "request");
+    const nodes = record.nodes;
+    if (!isFloat64Array(nodes) || nodes.length === 0) {
+        inputError("request.nodes must be a nonempty Float64Array");
+    }
+    for (let index = 0; index < nodes.length; index += 1) {
+        const value = nodes[index];
+        if (!Number.isFinite(value) || value < -1 || value > 1) {
+            inputError("request.nodes must be finite and lie in [-1, 1]");
+        }
+    }
+    let weights;
+    if (record.weights !== undefined) {
+        if (!isFloat64Array(record.weights) || record.weights.length !== nodes.length) {
+            inputError("request.weights must match request.nodes");
+        }
+        for (let index = 0; index < record.weights.length; index += 1) {
+            if (!Number.isFinite(record.weights[index])) {
+                inputError("request.weights must be finite");
+            }
+        }
+        weights = record.weights;
+    }
+    const images = record.images === "physical-only"
+        ? 0
+        : record.images === "perfect-ground-images"
+            ? 1
+            : inputError("request.images must be physical-only or perfect-ground-images");
+    const modes = record.modes === "latest-solution"
+        ? 0
+        : record.modes === "unit-current"
+            ? 1
+            : inputError("request.modes must be latest-solution or unit-current");
+    return {
+        nodes,
+        weights,
+        images,
+        modes,
+        modeKind: modes === 1 ? "unit-current" : "latest-solution",
+    };
+}
+function validateTarget(target) {
+    const record = requireRecord(target, "load.target");
+    const tag = integerInRange(record.tag, "load.target.tag", 0);
+    if (record.firstSegment === undefined) {
+        if (record.lastSegment !== undefined) {
+            inputError("load.target.lastSegment requires firstSegment");
+        }
+        return { tag, firstSegment: 0, lastSegment: 0 };
+    }
+    const firstSegment = integerInRange(record.firstSegment, "load.target.firstSegment", 1);
+    const lastSegment = record.lastSegment === undefined
+        ? firstSegment
+        : integerInRange(record.lastSegment, "load.target.lastSegment", 1);
+    if (lastSegment < firstSegment) {
+        inputError("load.target.lastSegment cannot precede firstSegment");
+    }
+    return { tag, firstSegment, lastSegment };
+}
+function snapshotPorts(ports) {
+    return Object.freeze(ports.map((port) => Object.freeze(port.name === undefined
+        ? { tag: port.tag, segment: port.segment }
+        : { tag: port.tag, segment: port.segment, name: port.name })));
+}
+function incompatibleGroundError(message) {
+    throw new NecGeometryError(message, {
+        details: { symmetryFailure: "INCOMPATIBLE_GROUND" },
+    });
+}
+function checkedNativeSegmentCount(value, name) {
+    if (typeof value !== "bigint"
+        || value < 0n
+        || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new NecRuntimeError(`Native ${name} is outside the safe integer range`, {
+            details: { name, value },
+        });
+    }
+    return Number(value);
+}
+function nativeState(value) {
+    switch (value) {
+        case 0:
+            return "empty";
+        case 1:
+            return "geometry-building";
+        case 2:
+            return "geometry-complete";
+        case 3:
+            return "prepared";
+        case 4:
+            return "solved";
+        default:
+            throw new NecRuntimeError(`The native model returned invalid state ${value}`);
+    }
+}
+export class WasmNecModel {
+    #moduleStorage;
+    #handle;
+    #state = "empty";
+    #ports = Object.freeze([]);
+    #maximumWireTag = 0;
+    #geometrySymmetry;
+    #evaluator;
+    constructor(module, handle, evaluator = "exact") {
+        this.#evaluator = selectEvaluator(evaluator);
+        this.#moduleStorage = module;
+        this.#handle = handle;
+        try {
+            this.#state = nativeState(module._necpp_wasm_v1_model_state(handle));
+        }
+        catch (cause) {
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError("Failed to read the new native model state", {
+                cause,
+            });
+        }
+        if (this.#state !== "empty") {
+            throw new NecRuntimeError(`A newly created native model started in unexpected state ${this.#state}`);
+        }
+    }
+    get state() {
+        return this.#state;
+    }
+    get #module() {
+        if (this.#moduleStorage === undefined) {
+            throw new NecRuntimeError("The disposed model no longer has a WASM module");
+        }
+        return this.#moduleStorage;
+    }
+    #assertOperation(operation) {
+        transitionModelState(this.#state, operation);
+    }
+    #syncState() {
+        if (this.#handle === 0) {
+            this.#state = "disposed";
+            return;
+        }
+        this.#state = nativeState(this.#module._necpp_wasm_v1_model_state(this.#handle));
+    }
+    #decodeBytes(pointer, length) {
+        if (!Number.isSafeInteger(pointer)
+            || pointer < 0
+            || !Number.isSafeInteger(length)
+            || length < 0
+            || pointer + length > this.#module.HEAPU8.length) {
+            throw new NecRuntimeError("The native module returned an invalid string buffer");
+        }
+        return textDecoder.decode(this.#module.HEAPU8.slice(pointer, pointer + length));
+    }
+    #decodeCString(pointer) {
+        if (!Number.isSafeInteger(pointer)
+            || pointer <= 0
+            || pointer >= this.#module.HEAPU8.length) {
+            return "";
+        }
+        const end = this.#module.HEAPU8.indexOf(0, pointer);
+        if (end < 0) {
+            throw new NecRuntimeError("The native module returned an unterminated string");
+        }
+        return this.#decodeBytes(pointer, end - pointer);
+    }
+    #lastError() {
+        try {
+            return this.#decodeCString(this.#module._necpp_wasm_v1_last_error(this.#handle));
+        }
+        catch {
+            return "";
+        }
+    }
+    #statusError(status, operation, symmetryFailure) {
+        const message = this.#lastError() || `${operation} failed with native status ${status}`;
+        const details = symmetryFailure === undefined || status !== STATUS_GEOMETRY
+            ? { operation, nativeStatus: status }
+            : { operation, nativeStatus: status, symmetryFailure };
+        switch (status) {
+            case STATUS_STATE:
+                throw new NecStateError(operation, this.#state, message);
+            case STATUS_INPUT:
+                throw new NecInputError(message, { details });
+            case STATUS_GEOMETRY:
+                throw new NecGeometryError(message, { details });
+            case STATUS_PORT:
+                throw new NecPortError(message, { details });
+            case STATUS_CONDITIONING:
+                throw new NecConditioningError(message, { details });
+            case STATUS_SOLVER:
+                throw new NecSolverError(message, { details });
+            case STATUS_RUNTIME:
+                throw new NecRuntimeError(message, { details });
+            default:
+                throw new NecRuntimeError(`${operation} returned unknown native status ${status}`, { details });
+        }
+    }
+    #invokeStatus(operation, call, symmetryFailure) {
+        let status;
+        try {
+            status = call();
+            this.#syncState();
+        }
+        catch (cause) {
+            try {
+                this.#syncState();
+            }
+            catch {
+                // Preserve the original boundary failure.
+            }
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError(`${operation} failed at the WASM boundary`, {
+                cause,
+                details: { operation },
+            });
+        }
+        if (status !== STATUS_OK) {
+            this.#statusError(status, operation, symmetryFailure);
+        }
+    }
+    #completionResult(symmetry) {
+        return this.#readResult("completeGeometry", () => {
+            const nativeKind = this.#module._necpp_wasm_v1_geometry_symmetry_kind(this.#handle);
+            const sectionCount = this.#module._necpp_wasm_v1_geometry_section_count(this.#handle);
+            const fundamentalRaw = this.#module._necpp_wasm_v1_geometry_fundamental_segment_count(this.#handle);
+            const fullRaw = this.#module._necpp_wasm_v1_geometry_full_segment_count(this.#handle);
+            const fundamentalSegmentCount = checkedNativeSegmentCount(fundamentalRaw, "fundamental segment count");
+            const fullSegmentCount = checkedNativeSegmentCount(fullRaw, "full segment count");
+            const expectedKind = symmetry?.nativeKind ?? 0;
+            const expectedSections = symmetry?.sectionCount ?? 1;
+            if (nativeKind !== expectedKind
+                || sectionCount !== expectedSections
+                || !Number.isSafeInteger(sectionCount)
+                || fullRaw !== fundamentalRaw * BigInt(sectionCount)) {
+                throw new NecRuntimeError("Native geometry completion metadata is inconsistent", {
+                    details: {
+                        nativeKind,
+                        expectedKind,
+                        sectionCount,
+                        expectedSections,
+                        fundamentalSegmentCount,
+                        fullSegmentCount,
+                    },
+                });
+            }
+            if (symmetry === undefined) {
+                return Object.freeze({});
+            }
+            return Object.freeze({
+                symmetry: createSymmetryExpansion(symmetry, fundamentalSegmentCount, fullSegmentCount),
+            });
+        });
+    }
+    #readResult(operation, read) {
+        try {
+            return read();
+        }
+        catch (cause) {
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError(`${operation} returned an invalid native result`, { cause, details: { operation } });
+        }
+    }
+    #allocate(bytes) {
+        let pointer;
+        try {
+            pointer = this.#module._malloc(bytes);
+        }
+        catch (cause) {
+            throw new NecRuntimeError("WASM memory allocation failed", { cause });
+        }
+        if (!Number.isSafeInteger(pointer) || pointer <= 0) {
+            throw new NecRuntimeError("WASM memory allocation failed");
+        }
+        return pointer;
+    }
+    #free(pointer) {
+        if (pointer === 0) {
+            return;
+        }
+        try {
+            this.#module._free(pointer);
+        }
+        catch {
+            // Emscripten free is not expected to throw; cleanup remains best-effort.
+        }
+    }
+    #withInt32Pair(first, second, call) {
+        let firstPointer = 0;
+        let secondPointer = 0;
+        try {
+            firstPointer = this.#allocate(first.byteLength);
+            secondPointer = this.#allocate(second.byteLength);
+            this.#module.HEAP32.set(first, firstPointer / INT32_BYTES);
+            this.#module.HEAP32.set(second, secondPointer / INT32_BYTES);
+            return call(firstPointer, secondPointer);
+        }
+        finally {
+            this.#free(secondPointer);
+            this.#free(firstPointer);
+        }
+    }
+    #withFloat64Pair(first, second, call) {
+        let firstPointer = 0;
+        let secondPointer = 0;
+        try {
+            firstPointer = this.#allocate(first.byteLength);
+            secondPointer = this.#allocate(second.byteLength);
+            this.#module.HEAPF64.set(first, firstPointer / FLOAT64_BYTES);
+            this.#module.HEAPF64.set(second, secondPointer / FLOAT64_BYTES);
+            return call(firstPointer, secondPointer);
+        }
+        finally {
+            this.#free(secondPointer);
+            this.#free(firstPointer);
+        }
+    }
+    #copyBuffer(kind, expectedLength) {
+        try {
+            const length = this.#module._necpp_wasm_v1_result_buffer_length(this.#handle, kind);
+            const pointer = this.#module._necpp_wasm_v1_result_buffer(this.#handle, kind);
+            if (length !== expectedLength
+                || !Number.isSafeInteger(pointer)
+                || pointer < 0
+                || pointer % FLOAT64_BYTES !== 0
+                || (length > 0 && pointer === 0)) {
+                throw new NecRuntimeError(`Native result buffer ${kind} has invalid dimensions`, { details: { kind, expectedLength, actualLength: length, pointer } });
+            }
+            const start = pointer / FLOAT64_BYTES;
+            const end = start + length;
+            if (start < 0 || end > this.#module.HEAPF64.length) {
+                throw new NecRuntimeError(`Native result buffer ${kind} is out of bounds`);
+            }
+            return this.#module.HEAPF64.slice(start, end);
+        }
+        catch (cause) {
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError(`Failed to copy native result buffer ${kind}`, {
+                cause,
+                details: { kind },
+            });
+        }
+    }
+    #copyInt32Buffer(kind, expectedLength) {
+        try {
+            const length = this.#module._necpp_wasm_v1_int32_result_buffer_length(this.#handle, kind);
+            const pointer = this.#module._necpp_wasm_v1_int32_result_buffer(this.#handle, kind);
+            if (length !== expectedLength
+                || !Number.isSafeInteger(pointer)
+                || pointer < 0
+                || pointer % INT32_BYTES !== 0
+                || (length > 0 && pointer === 0)) {
+                throw new NecRuntimeError(`Native int32 result buffer ${kind} has invalid dimensions`, { details: { kind, expectedLength, actualLength: length, pointer } });
+            }
+            const start = pointer / INT32_BYTES;
+            const end = start + length;
+            if (start < 0 || end > this.#module.HEAP32.length) {
+                throw new NecRuntimeError(`Native int32 result buffer ${kind} is out of bounds`);
+            }
+            return this.#module.HEAP32.slice(start, end);
+        }
+        catch (cause) {
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError(`Failed to copy native int32 result buffer ${kind}`, { cause, details: { kind } });
+        }
+    }
+    #copyPackedBuffer(kind) {
+        try {
+            const length = this.#module._necpp_wasm_v1_packed_buffer_length(this.#handle, kind);
+            const pointer = this.#module._necpp_wasm_v1_packed_buffer(this.#handle, kind);
+            if (!Number.isSafeInteger(length)
+                || length < 0
+                || !Number.isSafeInteger(pointer)
+                || pointer < 0
+                || (length > 0 && pointer === 0)) {
+                throw new NecRuntimeError(`Native packed buffer ${kind} has invalid dimensions`, { details: { kind, length, pointer } });
+            }
+            if (pointer + length > this.#module.HEAPU8.length) {
+                throw new NecRuntimeError(`Native packed buffer ${kind} is out of bounds`);
+            }
+            const copy = this.#module.HEAPU8.slice(pointer, pointer + length);
+            if (copy.byteOffset === 0 && copy.buffer.byteLength === length) {
+                return copy.buffer;
+            }
+            const exact = new ArrayBuffer(length);
+            new Uint8Array(exact).set(copy);
+            return exact;
+        }
+        catch (cause) {
+            if (cause instanceof NecRuntimeError) {
+                throw cause;
+            }
+            throw new NecRuntimeError(`Failed to copy native packed buffer ${kind}`, {
+                cause,
+                details: { kind },
+            });
+        }
+    }
+    #withQuadratureInputs(nodes, weights, call) {
+        let nodesPointer = 0;
+        let weightsPointer = 0;
+        try {
+            nodesPointer = this.#allocate(nodes.byteLength);
+            this.#module.HEAPF64.set(nodes, nodesPointer / FLOAT64_BYTES);
+            if (weights !== undefined) {
+                weightsPointer = this.#allocate(weights.byteLength);
+                this.#module.HEAPF64.set(weights, weightsPointer / FLOAT64_BYTES);
+            }
+            return call(nodesPointer, nodes.length, weightsPointer, weights === undefined ? 0 : weights.length);
+        }
+        finally {
+            this.#free(weightsPointer);
+            this.#free(nodesPointer);
+        }
+    }
+    #matrix(realKind, imagKind, order) {
+        const length = order * order;
+        return {
+            rows: order,
+            columns: order,
+            order: "row-major",
+            real: this.#copyBuffer(realKind, length),
+            imag: this.#copyBuffer(imagKind, length),
+        };
+    }
+    addWire(wire) {
+        this.#assertOperation("addWire");
+        const record = requireRecord(wire, "wire");
+        const tag = integerInRange(record.tag, "wire.tag", 1);
+        const segments = integerInRange(record.segments, "wire.segments", 1);
+        const start = validatePoint(record.start, "wire.start");
+        const end = validatePoint(record.end, "wire.end");
+        if (start[0] === end[0] && start[1] === end[1] && start[2] === end[2]) {
+            inputError("wire.start and wire.end must be distinct");
+        }
+        const radiusM = positiveNumber(record.radiusM, "wire.radiusM");
+        this.#invokeStatus("addWire", () => this.#module._necpp_wasm_v1_add_wire(this.#handle, tag, segments, start[0], start[1], start[2], end[0], end[1], end[2], radiusM));
+        this.#maximumWireTag = Math.max(this.#maximumWireTag, tag);
+    }
+    completeGeometry(options = {}) {
+        this.#assertOperation("completeGeometry");
+        const record = requireRecord(options, "options");
+        const connection = record.groundConnection ?? "none";
+        const nativeConnection = connection === "none"
+            ? 0
+            : connection === "interpolate"
+                ? 1
+                : connection === "zero-current"
+                    ? 2
+                    : inputError("Unknown ground connection", { connection });
+        const symmetry = record.symmetry === undefined
+            ? undefined
+            : validateGeometrySymmetry(record.symmetry, this.#maximumWireTag);
+        if (symmetry?.reflectsZ === true && nativeConnection !== 0) {
+            incompatibleGroundError("Structural reflection through z=0 is incompatible with ground connection");
+        }
+        if (symmetry === undefined) {
+            this.#invokeStatus("completeGeometry", () => this.#module._necpp_wasm_v1_complete_geometry(this.#handle, nativeConnection));
+        }
+        else {
+            this.#invokeStatus("completeGeometry", () => this.#module._necpp_wasm_v1_complete_geometry_symmetric(this.#handle, nativeConnection, symmetry.nativeKind, symmetry.parameter, symmetry.tagIncrement));
+        }
+        const result = this.#completionResult(symmetry);
+        this.#geometrySymmetry = symmetry;
+        return result;
+    }
+    definePorts(ports) {
+        this.#assertOperation("definePorts");
+        if (!Array.isArray(ports) || ports.length === 0) {
+            throw new NecPortError("At least one port is required");
+        }
+        if (ports.length > INT32_MAX) {
+            inputError("Too many ports");
+        }
+        const tags = new Int32Array(ports.length);
+        const segments = new Int32Array(ports.length);
+        const copies = [];
+        for (let index = 0; index < ports.length; index += 1) {
+            const record = requireRecord(ports[index], `ports[${index}]`);
+            const tag = integerInRange(record.tag, `ports[${index}].tag`, 1);
+            const segment = integerInRange(record.segment, `ports[${index}].segment`, 1);
+            if (record.name !== undefined && typeof record.name !== "string") {
+                inputError(`ports[${index}].name must be a string`);
+            }
+            tags[index] = tag;
+            segments[index] = segment;
+            copies.push(record.name === undefined
+                ? { tag, segment }
+                : { tag, segment, name: record.name });
+        }
+        this.#invokeStatus("definePorts", () => this.#withInt32Pair(tags, segments, (tagsPointer, segmentsPointer) => this.#module._necpp_wasm_v1_define_ports(this.#handle, tagsPointer, segmentsPointer, ports.length)));
+        this.#ports = snapshotPorts(copies);
+    }
+    addLoad(load) {
+        this.#assertOperation("addLoad");
+        const record = requireRecord(load, "load");
+        const target = validateTarget(record.target);
+        let kind;
+        let value1;
+        let value2 = 0;
+        let value3 = 0;
+        switch (record.kind) {
+            case "series-rlc":
+            case "parallel-rlc": {
+                if (record.perMeter !== undefined
+                    && record.perMeter !== true
+                    && record.perMeter !== false) {
+                    inputError("load.perMeter must be boolean when supplied");
+                }
+                const distributed = record.perMeter === true;
+                kind = record.kind === "series-rlc"
+                    ? (distributed ? 2 : 0)
+                    : (distributed ? 3 : 1);
+                value1 = finiteNumber(record.resistanceOhm, "load.resistanceOhm");
+                value2 = finiteNumber(record.inductanceH, "load.inductanceH");
+                value3 = finiteNumber(record.capacitanceF, "load.capacitanceF");
+                break;
+            }
+            case "impedance":
+                kind = 4;
+                value1 = finiteNumber(record.resistanceOhm, "load.resistanceOhm");
+                value2 = finiteNumber(record.reactanceOhm, "load.reactanceOhm");
+                break;
+            case "conductivity":
+                kind = 5;
+                value1 = positiveNumber(record.conductivitySPerM, "load.conductivitySPerM");
+                break;
+            default:
+                return inputError("Unknown load kind", { kind: record.kind });
+        }
+        this.#invokeStatus("addLoad", () => this.#module._necpp_wasm_v1_add_load(this.#handle, kind, target.tag, target.firstSegment, target.lastSegment, value1, value2, value3));
+    }
+    clearLoads() {
+        this.#assertOperation("clearLoads");
+        this.#invokeStatus("clearLoads", () => this.#module._necpp_wasm_v1_clear_loads(this.#handle));
+    }
+    setGround(ground) {
+        this.#assertOperation("setGround");
+        const record = requireRecord(ground, "ground");
+        let kind;
+        let relativePermittivity = 0;
+        let conductivitySPerM = 0;
+        switch (record.kind) {
+            case "free-space":
+                kind = 0;
+                break;
+            case "perfect":
+                kind = 1;
+                break;
+            case "finite":
+                kind = record.method === "reflection-coefficient"
+                    ? 2
+                    : record.method === "sommerfeld-norton"
+                        ? 3
+                        : inputError("Unknown finite-ground method", { method: record.method });
+                relativePermittivity = positiveNumber(record.relativePermittivity, "ground.relativePermittivity");
+                conductivitySPerM = positiveNumber(record.conductivitySPerM, "ground.conductivitySPerM");
+                break;
+            default:
+                return inputError("Unknown ground kind", { kind: record.kind });
+        }
+        if (kind !== 0 && this.#geometrySymmetry?.reflectsZ === true) {
+            incompatibleGroundError("Structural reflection through z=0 is incompatible with ground");
+        }
+        this.#invokeStatus("setGround", () => this.#module._necpp_wasm_v1_set_ground(this.#handle, kind, relativePermittivity, conductivitySPerM), this.#geometrySymmetry === undefined ? undefined : "INCOMPATIBLE_GROUND");
+    }
+    prepare(options) {
+        this.#assertOperation("prepare");
+        const record = requireRecord(options, "options");
+        const frequencyMHz = positiveNumber(record.frequencyMHz, "options.frequencyMHz");
+        this.#invokeStatus("prepare", () => this.#module._necpp_wasm_v1_prepare(this.#handle, frequencyMHz), this.#geometrySymmetry === undefined ? undefined : "INCOMPLETE_LOAD_ORBIT");
+    }
+    computeImpedanceMatrix() {
+        this.#assertOperation("computeImpedanceMatrix");
+        this.#invokeStatus("computeImpedanceMatrix", () => this.#module._necpp_wasm_v1_compute_impedance(this.#handle));
+        return this.#readResult("computeImpedanceMatrix", () => {
+            const order = this.#module._necpp_wasm_v1_impedance_order(this.#handle);
+            if (order !== this.#ports.length || !Number.isSafeInteger(order)) {
+                throw new NecRuntimeError("The native impedance matrix has invalid order");
+            }
+            const conditionEstimate = this.#module._necpp_wasm_v1_impedance_condition_estimate(this.#handle);
+            if (!Number.isFinite(conditionEstimate) || conditionEstimate < 0) {
+                throw new NecRuntimeError("The native condition estimate is invalid");
+            }
+            return {
+                impedance: this.#matrix(BUFFER.impedanceReal, BUFFER.impedanceImag, order),
+                admittance: this.#matrix(BUFFER.admittanceReal, BUFFER.admittanceImag, order),
+                conditionEstimate,
+                frequencyMHz: this.#module._necpp_wasm_v1_impedance_frequency_mhz(this.#handle),
+                factorizationGeneration: this.#module._necpp_wasm_v1_impedance_factorization_generation(this.#handle),
+            };
+        });
+    }
+    #solution(drive) {
+        const count = this.#module._necpp_wasm_v1_solution_count(this.#handle);
+        const nativeDrive = this.#module._necpp_wasm_v1_solution_drive(this.#handle);
+        if (count !== this.#ports.length
+            || !Number.isSafeInteger(count)
+            || nativeDrive !== (drive === "voltage" ? 0 : 1)) {
+            throw new NecRuntimeError("The native port solution has invalid metadata");
+        }
+        const complex = (realKind, imagKind) => ({
+            real: this.#copyBuffer(realKind, count),
+            imag: this.#copyBuffer(imagKind, count),
+        });
+        const inputPowerW = this.#module._necpp_wasm_v1_solution_input_power_w(this.#handle);
+        const radiatedPowerW = this.#module._necpp_wasm_v1_solution_radiated_power_w(this.#handle);
+        const structureLossW = this.#module._necpp_wasm_v1_solution_structure_loss_w(this.#handle);
+        const networkLossW = this.#module._necpp_wasm_v1_solution_network_loss_w(this.#handle);
+        if (![inputPowerW, radiatedPowerW, structureLossW, networkLossW]
+            .every(Number.isFinite)) {
+            throw new NecRuntimeError("The native port solution has a nonfinite power budget");
+        }
+        const powerBudget = Object.freeze({
+            inputPowerW,
+            radiatedPowerW,
+            structureLossW,
+            networkLossW,
+            efficiencyPercent: inputPowerW === 0
+                ? null
+                : 100 * radiatedPowerW / inputPowerW,
+        });
+        return {
+            drive,
+            frequencyMHz: this.#module._necpp_wasm_v1_solution_frequency_mhz(this.#handle),
+            ports: snapshotPorts(this.#ports),
+            requested: complex(BUFFER.solutionRequestedReal, BUFFER.solutionRequestedImag),
+            voltages: complex(BUFFER.solutionVoltagesReal, BUFFER.solutionVoltagesImag),
+            currents: complex(BUFFER.solutionCurrentsReal, BUFFER.solutionCurrentsImag),
+            activeImpedances: complex(BUFFER.solutionActiveImpedancesReal, BUFFER.solutionActiveImpedancesImag),
+            powersW: this.#copyBuffer(BUFFER.solutionPowersW, count),
+            powerBudget,
+            factorizationGeneration: this.#module._necpp_wasm_v1_solution_factorization_generation(this.#handle),
+            solveGeneration: this.#module._necpp_wasm_v1_solution_generation(this.#handle),
+        };
+    }
+    solveVoltages(voltages) {
+        this.#assertOperation("solveVoltages");
+        const vector = validateComplexVector(voltages, this.#ports.length, "voltages");
+        this.#invokeStatus("solveVoltages", () => this.#withFloat64Pair(vector.real, vector.imag, (realPointer, imagPointer) => this.#module._necpp_wasm_v1_solve_voltages(this.#handle, realPointer, imagPointer, vector.real.length)));
+        return this.#readResult("solveVoltages", () => this.#solution("voltage"));
+    }
+    solveCurrents(currents) {
+        this.#assertOperation("solveCurrents");
+        const vector = validateComplexVector(currents, this.#ports.length, "currents");
+        this.#invokeStatus("solveCurrents", () => this.#withFloat64Pair(vector.real, vector.imag, (realPointer, imagPointer) => this.#module._necpp_wasm_v1_solve_currents(this.#handle, realPointer, imagPointer, vector.real.length)));
+        return this.#readResult("solveCurrents", () => this.#solution("current"));
+    }
+    #farFieldResult(grid, validationMs, wasmCallMs, packageStarted) {
+        const extractionStarted = performance.now();
+        const thetaCount = this.#module._necpp_wasm_v1_far_field_theta_count(this.#handle);
+        const phiCount = this.#module._necpp_wasm_v1_far_field_phi_count(this.#handle);
+        if (thetaCount !== grid.thetaCount
+            || phiCount !== grid.phiCount
+            || thetaCount * phiCount !== grid.sampleCount) {
+            throw new NecRuntimeError("The native far-field result has invalid dimensions");
+        }
+        const result = {
+            radiusM: this.#module._necpp_wasm_v1_far_field_radius_m(this.#handle),
+            frequencyMHz: this.#module._necpp_wasm_v1_far_field_frequency_mhz(this.#handle),
+            thetaDeg: this.#copyBuffer(BUFFER.farFieldThetaDeg, thetaCount),
+            phiDeg: this.#copyBuffer(BUFFER.farFieldPhiDeg, phiCount),
+            eThetaReal: this.#copyBuffer(BUFFER.farFieldEThetaReal, grid.sampleCount),
+            eThetaImag: this.#copyBuffer(BUFFER.farFieldEThetaImag, grid.sampleCount),
+            ePhiReal: this.#copyBuffer(BUFFER.farFieldEPhiReal, grid.sampleCount),
+            ePhiImag: this.#copyBuffer(BUFFER.farFieldEPhiImag, grid.sampleCount),
+        };
+        const diagnostic = this.#module._necpp_wasm_v1_far_field_diagnostic;
+        if (diagnostic === undefined)
+            return result;
+        const value = (kind) => diagnostic(this.#handle, kind);
+        const typescriptExtractionMs = performance.now() - extractionStarted;
+        return {
+            ...result,
+            diagnostics: Object.freeze({
+                instrumentationEnabled: value(0) === 1,
+                validationMs,
+                wasmCallMs,
+                typescriptExtractionMs,
+                packageTotalMs: performance.now() - packageStarted,
+                native: Object.freeze({
+                    validationAllocationMs: value(1),
+                    resultReplacementMs: value(2),
+                    rawAccumulationMs: value(3),
+                    derivedRpWorkMs: value(4),
+                    resultCopyMs: value(5),
+                    totalMs: value(6),
+                    abiResultCopyMs: value(7),
+                    nativeAbiTotalMs: value(8),
+                }),
+                counts: Object.freeze({
+                    evaluatedDirections: value(9),
+                    segments: value(10),
+                    groundImages: value(11),
+                    segmentDirectionContributions: value(12),
+                    outputBufferAllocations: value(13),
+                    intermediateBufferAllocations: value(14),
+                    complexSampleCopies: value(15),
+                }),
+            }),
+        };
+    }
+    #evaluation(ring, available, grid, bases = 1) {
+        if (!ring)
+            return {};
+        if (!available)
+            return { fieldEvaluation: evaluationMetadata(grid.sampleCount * bases, 0, grid.thetaCount * bases, 0, "ring-capability-unavailable") };
+        const v = (index) => this.#module._necpp_wasm_v1_ring_diagnostic(this.#handle, index);
+        return { fieldEvaluation: evaluationMetadata(v(0), v(1), v(2), v(3), ringReasons[v(4)]) };
+    }
+    computeFarField(request) {
+        const packageStarted = performance.now();
+        this.#assertOperation("computeFarField");
+        const grid = validateGrid(request);
+        const ring = selectEvaluator(request.evaluator, this.#evaluator) === "ring";
+        const available = typeof this.#module._necpp_wasm_v1_compute_far_field_ring === "function"
+            && typeof this.#module._necpp_wasm_v1_ring_diagnostic === "function";
+        const compute = ring && available ? this.#module._necpp_wasm_v1_compute_far_field_ring : this.#module._necpp_wasm_v1_compute_far_field;
+        const validationMs = performance.now() - packageStarted;
+        const wasmCallStarted = performance.now();
+        this.#invokeStatus("computeFarField", () => compute(this.#handle, grid.radiusM, grid.thetaStartDeg, grid.thetaCount, grid.thetaStepDeg, grid.phiStartDeg, grid.phiCount, grid.phiStepDeg));
+        const wasmCallMs = performance.now() - wasmCallStarted;
+        return this.#readResult("computeFarField", () => ({ ...this.#farFieldResult(grid, validationMs, wasmCallMs, packageStarted), ...this.#evaluation(ring, available, grid) }));
+    }
+    /** @internal WP3 evaluator input. Unsupported modes are capability results. */
+    captureFarFieldEvaluationSnapshot() {
+        this.#assertOperation("computeFarField");
+        this.#invokeStatus("computeFarField", () => this.#module._necpp_wasm_v1_capture_far_field_snapshot(this.#handle));
+        const nativeCapability = this.#module._necpp_wasm_v1_far_field_snapshot_capability(this.#handle);
+        const capabilities = [
+            "supported",
+            "no-solution",
+            "surface-patches",
+            "finite-ground",
+            "unsupported-mode",
+        ];
+        const capability = capabilities[nativeCapability] ?? "unsupported-mode";
+        const segmentCount = this.#module._necpp_wasm_v1_far_field_snapshot_segment_count(this.#handle);
+        const copy = (kind) => capability === "supported"
+            ? this.#copyBuffer(kind, segmentCount)
+            : new Float64Array();
+        return {
+            schemaVersion: 1,
+            capability,
+            frequencyMHz: this.#module._necpp_wasm_v1_far_field_snapshot_frequency_mhz(this.#handle),
+            wavelengthM: this.#module._necpp_wasm_v1_far_field_snapshot_wavelength_m(this.#handle),
+            modelGeneration: this.#module._necpp_wasm_v1_far_field_snapshot_model_generation(this.#handle),
+            solutionGeneration: this.#module._necpp_wasm_v1_far_field_snapshot_solution_generation(this.#handle),
+            perfectGround: this.#module._necpp_wasm_v1_far_field_snapshot_perfect_ground(this.#handle) === 1,
+            segmentCount,
+            x: copy(BUFFER.snapshotX),
+            y: copy(BUFFER.snapshotY),
+            z: copy(BUFFER.snapshotZ),
+            cab: copy(BUFFER.snapshotCab),
+            sab: copy(BUFFER.snapshotSab),
+            salp: copy(BUFFER.snapshotSalp),
+            segmentHalfLengths: copy(BUFFER.snapshotHalfLength),
+            air: copy(BUFFER.snapshotAir),
+            aii: copy(BUFFER.snapshotAii),
+            bir: copy(BUFFER.snapshotBir),
+            bii: copy(BUFFER.snapshotBii),
+            cir: copy(BUFFER.snapshotCir),
+            cii: copy(BUFFER.snapshotCii),
+        };
+    }
+    computeEmbeddedFarFields(request, normalization = {
+        kind: "unit-voltage",
+        valueV: 1,
+    }) {
+        this.#assertOperation("computeEmbeddedFarFields");
+        const grid = validateGrid(request, this.#ports.length);
+        const ring = selectEvaluator(request.evaluator, this.#evaluator) === "ring";
+        const available = typeof this.#module._necpp_wasm_v1_compute_embedded_far_fields_ring === "function"
+            && typeof this.#module._necpp_wasm_v1_ring_diagnostic === "function";
+        const compute = ring && available ? this.#module._necpp_wasm_v1_compute_embedded_far_fields_ring : this.#module._necpp_wasm_v1_compute_embedded_far_fields;
+        const record = requireRecord(normalization, "normalization");
+        const nativeNormalization = record.kind === "unit-voltage"
+            && record.valueV === 1
+            ? 0
+            : record.kind === "unit-current" && record.valueA === 1
+                ? 1
+                : inputError("normalization must request exactly one volt or one ampere");
+        this.#invokeStatus("computeEmbeddedFarFields", () => compute(this.#handle, grid.radiusM, grid.thetaStartDeg, grid.thetaCount, grid.thetaStepDeg, grid.phiStartDeg, grid.phiCount, grid.phiStepDeg, nativeNormalization));
+        return this.#readResult("computeEmbeddedFarFields", () => {
+            const thetaCount = this.#module._necpp_wasm_v1_embedded_theta_count(this.#handle);
+            const phiCount = this.#module._necpp_wasm_v1_embedded_phi_count(this.#handle);
+            const portCount = this.#module._necpp_wasm_v1_embedded_port_count(this.#handle);
+            const samplesPerPort = this.#module._necpp_wasm_v1_embedded_samples_per_port(this.#handle);
+            const returnedNormalization = this.#module._necpp_wasm_v1_embedded_normalization(this.#handle);
+            if (thetaCount !== grid.thetaCount
+                || phiCount !== grid.phiCount
+                || portCount !== this.#ports.length
+                || samplesPerPort !== grid.sampleCount
+                || returnedNormalization !== nativeNormalization) {
+                throw new NecRuntimeError("The native embedded far-field result has invalid metadata");
+            }
+            const totalSamples = samplesPerPort * portCount;
+            const resultNormalization = nativeNormalization === 0
+                ? Object.freeze({ kind: "unit-voltage", valueV: 1 })
+                : Object.freeze({ kind: "unit-current", valueA: 1 });
+            return {
+                ...this.#evaluation(ring, available, grid, this.#ports.length),
+                radiusM: this.#module._necpp_wasm_v1_embedded_radius_m(this.#handle),
+                frequencyMHz: this.#module._necpp_wasm_v1_embedded_frequency_mhz(this.#handle),
+                thetaDeg: this.#copyBuffer(BUFFER.embeddedThetaDeg, thetaCount),
+                phiDeg: this.#copyBuffer(BUFFER.embeddedPhiDeg, phiCount),
+                eThetaReal: this.#copyBuffer(BUFFER.embeddedEThetaReal, totalSamples),
+                eThetaImag: this.#copyBuffer(BUFFER.embeddedEThetaImag, totalSamples),
+                ePhiReal: this.#copyBuffer(BUFFER.embeddedEPhiReal, totalSamples),
+                ePhiImag: this.#copyBuffer(BUFFER.embeddedEPhiImag, totalSamples),
+                ports: snapshotPorts(this.#ports),
+                normalization: resultNormalization,
+                samplesPerPort,
+            };
+        });
+    }
+    getCurrentDistribution(options) {
+        this.#assertOperation("getCurrentDistribution");
+        const record = requireRecord(options, "options");
+        const mode = record.kind === "latest-solution"
+            ? 0
+            : record.kind === "unit-current"
+                ? 1
+                : inputError("options.kind must be latest-solution or unit-current");
+        if (mode === 0 && this.#state !== "solved") {
+            throw new NecStateError("getCurrentDistribution", this.#state, "getCurrentDistribution latest-solution requires a consumer solution");
+        }
+        this.#invokeStatus("getCurrentDistribution", () => this.#module._necpp_wasm_v1_get_current_distribution(this.#handle, mode));
+        return this.#readResult("getCurrentDistribution", () => {
+            const segmentCount = this.#module._necpp_wasm_v1_current_segment_count(this.#handle);
+            const modeCount = this.#module._necpp_wasm_v1_current_mode_count(this.#handle);
+            const modeKind = this.#module._necpp_wasm_v1_current_mode_kind(this.#handle);
+            if (!Number.isSafeInteger(segmentCount)
+                || segmentCount < 1
+                || !Number.isSafeInteger(modeCount)
+                || modeCount < 1
+                || modeKind !== mode) {
+                throw new NecRuntimeError("The native current distribution has invalid metadata");
+            }
+            const tags = this.#copyInt32Buffer(INT32_BUFFER.currentTag, segmentCount);
+            const segments = this.#copyInt32Buffer(INT32_BUFFER.currentSegment, segmentCount);
+            const nativeIndex = this.#copyInt32Buffer(INT32_BUFFER.currentNativeIndex, segmentCount);
+            const startKind = this.#copyInt32Buffer(INT32_BUFFER.currentStartKind, segmentCount);
+            const startTag = this.#copyInt32Buffer(INT32_BUFFER.currentStartTag, segmentCount);
+            const startSegment = this.#copyInt32Buffer(INT32_BUFFER.currentStartSegment, segmentCount);
+            const startEnd = this.#copyInt32Buffer(INT32_BUFFER.currentStartEnd, segmentCount);
+            const endKind = this.#copyInt32Buffer(INT32_BUFFER.currentEndKind, segmentCount);
+            const endTag = this.#copyInt32Buffer(INT32_BUFFER.currentEndTag, segmentCount);
+            const endSegment = this.#copyInt32Buffer(INT32_BUFFER.currentEndSegment, segmentCount);
+            const endEnd = this.#copyInt32Buffer(INT32_BUFFER.currentEndEnd, segmentCount);
+            const identities = Array.from({ length: segmentCount }, (_, index) => ({
+                tag: tags[index],
+                segment: segments[index],
+                nativeIndex: nativeIndex[index],
+            }));
+            const startEnds = Array.from({ length: segmentCount }, (_, index) => decodeSegmentEnd(startKind[index], startTag[index], startSegment[index], startEnd[index]));
+            const endEnds = Array.from({ length: segmentCount }, (_, index) => decodeSegmentEnd(endKind[index], endTag[index], endSegment[index], endEnd[index]));
+            const planeLength = modeCount * segmentCount;
+            return {
+                schemaVersion: 1,
+                frequencyMHz: this.#module._necpp_wasm_v1_current_frequency_mhz(this.#handle),
+                wavelengthM: this.#module._necpp_wasm_v1_current_wavelength_m(this.#handle),
+                modeKind: mode === 1 ? "unit-current" : "latest-solution",
+                modeCount,
+                segments: Object.freeze(identities),
+                startEnds: Object.freeze(startEnds),
+                endEnds: Object.freeze(endEnds),
+                centresM: this.#copyBuffer(BUFFER.currentCentres, 3 * segmentCount),
+                startsM: this.#copyBuffer(BUFFER.currentStarts, 3 * segmentCount),
+                endsM: this.#copyBuffer(BUFFER.currentEnds, 3 * segmentCount),
+                tangents: this.#copyBuffer(BUFFER.currentTangents, 3 * segmentCount),
+                radiiM: this.#copyBuffer(BUFFER.currentRadii, segmentCount),
+                lengthsM: this.#copyBuffer(BUFFER.currentLengths, segmentCount),
+                aReal: this.#copyBuffer(BUFFER.currentAReal, planeLength),
+                aImag: this.#copyBuffer(BUFFER.currentAImag, planeLength),
+                bReal: this.#copyBuffer(BUFFER.currentBReal, planeLength),
+                bImag: this.#copyBuffer(BUFFER.currentBImag, planeLength),
+                cReal: this.#copyBuffer(BUFFER.currentCReal, planeLength),
+                cImag: this.#copyBuffer(BUFFER.currentCImag, planeLength),
+            };
+        });
+    }
+    prepareCurrentQuadrature(request) {
+        this.#assertOperation("prepareCurrentQuadrature");
+        const quadrature = validatePreparedQuadrature(request);
+        if (quadrature.modes === 0 && this.#state !== "solved") {
+            throw new NecStateError("prepareCurrentQuadrature", this.#state, "prepareCurrentQuadrature latest-solution requires a consumer solution");
+        }
+        this.#invokeStatus("prepareCurrentQuadrature", () => this.#withQuadratureInputs(quadrature.nodes, quadrature.weights, (nodesPointer, nodeCount, weightsPointer, weightCount) => this.#module._necpp_wasm_v1_prepare_current_quadrature(this.#handle, nodesPointer, nodeCount, weightsPointer, weightCount, quadrature.images, quadrature.modes)));
+        return this.#readResult("prepareCurrentQuadrature", () => {
+            const buffer = this.#copyPackedBuffer(PACKED_BUFFER.quadrature);
+            return {
+                schemaVersion: 1,
+                byteLength: buffer.byteLength,
+                buffer,
+            };
+        });
+    }
+    characterizeIsolatedElement(request) {
+        this.#assertOperation("characterizeIsolatedElement");
+        const record = requireRecord(request, "request");
+        const quadrature = validatePreparedQuadrature(record.quadrature);
+        if (quadrature.modeKind !== "unit-current") {
+            inputError("CHARACTERIZE ISOLATED ELEMENT: CURRENT MODES MUST BE UNIT-CURRENT");
+        }
+        const grid = validateGrid(record.field, this.#ports.length);
+        const ring = selectEvaluator(request.field.evaluator, this.#evaluator) === "ring";
+        const available = typeof this.#module._necpp_wasm_v1_characterize_isolated_element_ring === "function"
+            && typeof this.#module._necpp_wasm_v1_ring_diagnostic === "function";
+        const compute = ring && available ? this.#module._necpp_wasm_v1_characterize_isolated_element_ring : this.#module._necpp_wasm_v1_characterize_isolated_element;
+        this.#invokeStatus("characterizeIsolatedElement", () => this.#withQuadratureInputs(quadrature.nodes, quadrature.weights, (nodesPointer, nodeCount, weightsPointer, weightCount) => compute(this.#handle, nodesPointer, nodeCount, weightsPointer, weightCount, quadrature.images, grid.radiusM, grid.thetaStartDeg, grid.thetaCount, grid.thetaStepDeg, grid.phiStartDeg, grid.phiCount, grid.phiStepDeg)));
+        return this.#readResult("characterizeIsolatedElement", () => {
+            const order = this.#module._necpp_wasm_v1_impedance_order(this.#handle);
+            const quadratureBuffer = this.#copyPackedBuffer(PACKED_BUFFER.quadrature);
+            const embeddedBuffer = this.#copyPackedBuffer(PACKED_BUFFER.embeddedField);
+            return {
+                ...this.#evaluation(ring, available, grid, this.#ports.length),
+                impedance: this.#matrix(BUFFER.impedanceReal, BUFFER.impedanceImag, order),
+                admittance: this.#matrix(BUFFER.admittanceReal, BUFFER.admittanceImag, order),
+                quadrature: {
+                    schemaVersion: 1,
+                    byteLength: quadratureBuffer.byteLength,
+                    buffer: quadratureBuffer,
+                },
+                embeddedField: {
+                    schemaVersion: 1,
+                    byteLength: embeddedBuffer.byteLength,
+                    buffer: embeddedBuffer,
+                },
+            };
+        });
+    }
+    dispose() {
+        if (this.#state === "disposed") {
+            return;
+        }
+        const handle = this.#handle;
+        const module = this.#moduleStorage;
+        this.#handle = 0;
+        this.#moduleStorage = undefined;
+        this.#state = "disposed";
+        this.#ports = Object.freeze([]);
+        this.#geometrySymmetry = undefined;
+        this.#maximumWireTag = 0;
+        try {
+            module?._necpp_wasm_v1_model_delete(handle);
+        }
+        catch {
+            // The ABI promises contained, deterministic cleanup.
+        }
+    }
+}
+export function createModelFromModule(module, evaluator = "exact") {
+    let handle;
+    try {
+        handle = module._necpp_wasm_v1_model_create();
+    }
+    catch (cause) {
+        throw new NecRuntimeError("Failed to create the native NEC model", { cause });
+    }
+    if (!Number.isSafeInteger(handle) || handle <= 0) {
+        throw new NecRuntimeError("Failed to create the native NEC model");
+    }
+    try {
+        return new WasmNecModel(module, handle, evaluator);
+    }
+    catch (error) {
+        try {
+            module._necpp_wasm_v1_model_delete(handle);
+        }
+        catch {
+            // Preserve the initialization error.
+        }
+        throw error;
+    }
+}

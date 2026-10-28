@@ -1,0 +1,544 @@
+import { selectEvaluator, reviveEvaluation } from "./field-selection.js";
+import { NecConditioningError, NecError, NecGeometryError, NecInputError, NecPortError, NecRuntimeError, NecSolverError, NecStateError, } from "./errors.js";
+export function isNodeRuntime() {
+    const runtime = globalThis;
+    return typeof runtime.process === "object"
+        && runtime.process !== null
+        && typeof runtime.process.versions === "object"
+        && runtime.process.versions !== null
+        && typeof runtime.process.versions.node === "string"
+        && typeof runtime.window === "undefined";
+}
+export function isWorkerResponse(value) {
+    if (typeof value !== "object" || value === null) {
+        return false;
+    }
+    const kind = value.kind;
+    return kind === "ok"
+        || kind === "error"
+        || kind === "crash"
+        || kind === "progress";
+}
+function isArrayBuffer(value) {
+    return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+}
+function visitTransferables(value, buffers) {
+    if (value === null || value === undefined) {
+        return;
+    }
+    if (isArrayBuffer(value)) {
+        if (value.byteLength > 0) {
+            buffers.add(value);
+        }
+        return;
+    }
+    if (ArrayBuffer.isView(value)) {
+        const buffer = value.buffer;
+        if (isArrayBuffer(buffer) && buffer.byteLength > 0) {
+            buffers.add(buffer);
+        }
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            visitTransferables(item, buffers);
+        }
+        return;
+    }
+    if (typeof value === "object") {
+        for (const item of Object.values(value)) {
+            visitTransferables(item, buffers);
+        }
+    }
+}
+/** Collect unique, non-empty ArrayBuffers owned by a structured-cloneable result. */
+export function collectTransferables(value) {
+    const buffers = new Set();
+    visitTransferables(value, buffers);
+    return [...buffers];
+}
+function errorOptions(details) {
+    return details === undefined ? {} : { details };
+}
+export function serializeError(error) {
+    if (error instanceof NecStateError) {
+        const serialized = {
+            name: error.name,
+            code: error.code,
+            message: error.message,
+            operation: error.operation,
+            state: error.state,
+        };
+        return error.details === undefined
+            ? serialized
+            : { ...serialized, details: error.details };
+    }
+    if (error instanceof NecError) {
+        const serialized = {
+            name: error.name,
+            code: error.code,
+            message: error.message,
+        };
+        return error.details === undefined
+            ? serialized
+            : { ...serialized, details: error.details };
+    }
+    if (error instanceof Error) {
+        return {
+            name: "NecRuntimeError",
+            code: "NEC_RUNTIME",
+            message: error.message,
+        };
+    }
+    return {
+        name: "NecRuntimeError",
+        code: "NEC_RUNTIME",
+        message: String(error),
+    };
+}
+export function reviveError(serialized) {
+    switch (serialized.code) {
+        case "NEC_STATE":
+            return new NecStateError(serialized.operation ?? "unknown", serialized.state ?? "disposed", serialized.message);
+        case "NEC_INPUT":
+            return new NecInputError(serialized.message, errorOptions(serialized.details));
+        case "NEC_GEOMETRY":
+            return new NecGeometryError(serialized.message, errorOptions(serialized.details));
+        case "NEC_PORT":
+            return new NecPortError(serialized.message, errorOptions(serialized.details));
+        case "NEC_CONDITIONING":
+            return new NecConditioningError(serialized.message, errorOptions(serialized.details));
+        case "NEC_SOLVER":
+            return new NecSolverError(serialized.message, errorOptions(serialized.details));
+        default:
+            return new NecRuntimeError(serialized.message, errorOptions(serialized.details));
+    }
+}
+export function snapshotPorts(ports) {
+    return Object.freeze(ports.map((port) => Object.freeze(port.name === undefined
+        ? { tag: port.tag, segment: port.segment }
+        : { tag: port.tag, segment: port.segment, name: port.name })));
+}
+function safeNonnegativeInteger(value, name) {
+    if (typeof value !== "number"
+        || !Number.isSafeInteger(value)
+        || value < 0) {
+        throw new NecRuntimeError(`Worker result ${name} is not a safe integer`);
+    }
+    return value;
+}
+/** Validate, copy, and deeply freeze structured-cloned completion metadata. */
+export function reviveGeometryCompletionResult(value) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new NecRuntimeError("Worker geometry completion result is not an object");
+    }
+    const record = value;
+    if (record.symmetry === undefined) {
+        return Object.freeze({});
+    }
+    if (typeof record.symmetry !== "object"
+        || record.symmetry === null
+        || Array.isArray(record.symmetry)) {
+        throw new NecRuntimeError("Worker symmetry metadata is not an object");
+    }
+    const symmetry = record.symmetry;
+    if (symmetry.kind !== "reflection" && symmetry.kind !== "rotational") {
+        throw new NecRuntimeError("Worker symmetry metadata has an unknown kind");
+    }
+    const sectionCount = safeNonnegativeInteger(symmetry.sectionCount, "symmetry.sectionCount");
+    const fundamentalSegmentCount = safeNonnegativeInteger(symmetry.fundamentalSegmentCount, "symmetry.fundamentalSegmentCount");
+    const fullSegmentCount = safeNonnegativeInteger(symmetry.fullSegmentCount, "symmetry.fullSegmentCount");
+    if (sectionCount < 2
+        || BigInt(fullSegmentCount)
+            !== BigInt(fundamentalSegmentCount) * BigInt(sectionCount)
+        || !Array.isArray(symmetry.copies)
+        || symmetry.copies.length !== sectionCount) {
+        throw new NecRuntimeError("Worker symmetry metadata has inconsistent counts");
+    }
+    const copies = symmetry.copies.map((value, position) => {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            throw new NecRuntimeError(`Worker symmetry copy ${position} is invalid`);
+        }
+        const copy = value;
+        const index = safeNonnegativeInteger(copy.index, `symmetry.copies[${position}].index`);
+        const tagOffset = safeNonnegativeInteger(copy.tagOffset, `symmetry.copies[${position}].tagOffset`);
+        if (index !== position || typeof copy.transform !== "object" || copy.transform === null) {
+            throw new NecRuntimeError(`Worker symmetry copy ${position} is inconsistent`);
+        }
+        const transform = copy.transform;
+        if (symmetry.kind === "reflection") {
+            if (transform.kind !== "cartesian-signs"
+                || !Array.isArray(transform.signs)
+                || transform.signs.length !== 3
+                || !transform.signs.every((sign) => sign === 1 || sign === -1)) {
+                throw new NecRuntimeError(`Worker reflection copy ${position} is invalid`);
+            }
+            const signs = Object.freeze([
+                transform.signs[0],
+                transform.signs[1],
+                transform.signs[2],
+            ]);
+            return Object.freeze({
+                index,
+                tagOffset,
+                transform: Object.freeze({ kind: "cartesian-signs", signs }),
+            });
+        }
+        if (transform.kind !== "rotate-z" || typeof transform.angleDeg !== "number"
+            || !Number.isFinite(transform.angleDeg)) {
+            throw new NecRuntimeError(`Worker rotational copy ${position} is invalid`);
+        }
+        return Object.freeze({
+            index,
+            tagOffset,
+            transform: Object.freeze({
+                kind: "rotate-z",
+                angleDeg: transform.angleDeg,
+            }),
+        });
+    });
+    return Object.freeze({
+        symmetry: Object.freeze({
+            kind: symmetry.kind,
+            sectionCount,
+            fundamentalSegmentCount,
+            fullSegmentCount,
+            copies: Object.freeze(copies),
+        }),
+    });
+}
+function copyFloat64(value, name) {
+    if (Object.prototype.toString.call(value) !== "[object Float64Array]") {
+        throw new NecRuntimeError(`Worker result ${name} is not a Float64Array`);
+    }
+    return value;
+}
+function finiteWorkerNumber(value, name) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new NecRuntimeError(`Worker result ${name} is not finite`);
+    }
+    return value;
+}
+export function revivePortSolution(value) {
+    const record = value;
+    const inputPowerW = finiteWorkerNumber(record.powerBudget?.inputPowerW, "powerBudget.inputPowerW");
+    const radiatedPowerW = finiteWorkerNumber(record.powerBudget?.radiatedPowerW, "powerBudget.radiatedPowerW");
+    const structureLossW = finiteWorkerNumber(record.powerBudget?.structureLossW, "powerBudget.structureLossW");
+    const networkLossW = finiteWorkerNumber(record.powerBudget?.networkLossW, "powerBudget.networkLossW");
+    const efficiencyPercent = record.powerBudget?.efficiencyPercent;
+    if (efficiencyPercent !== null
+        && (typeof efficiencyPercent !== "number" || !Number.isFinite(efficiencyPercent))) {
+        throw new NecRuntimeError("Worker result powerBudget.efficiencyPercent is neither finite nor null");
+    }
+    return {
+        drive: record.drive,
+        frequencyMHz: record.frequencyMHz,
+        ports: snapshotPorts(record.ports),
+        requested: {
+            real: copyFloat64(record.requested.real, "requested.real"),
+            imag: copyFloat64(record.requested.imag, "requested.imag"),
+        },
+        voltages: {
+            real: copyFloat64(record.voltages.real, "voltages.real"),
+            imag: copyFloat64(record.voltages.imag, "voltages.imag"),
+        },
+        currents: {
+            real: copyFloat64(record.currents.real, "currents.real"),
+            imag: copyFloat64(record.currents.imag, "currents.imag"),
+        },
+        activeImpedances: {
+            real: copyFloat64(record.activeImpedances.real, "activeImpedances.real"),
+            imag: copyFloat64(record.activeImpedances.imag, "activeImpedances.imag"),
+        },
+        powersW: copyFloat64(record.powersW, "powersW"),
+        powerBudget: Object.freeze({
+            inputPowerW,
+            radiatedPowerW,
+            structureLossW,
+            networkLossW,
+            efficiencyPercent,
+        }),
+        factorizationGeneration: record.factorizationGeneration,
+        solveGeneration: record.solveGeneration,
+    };
+}
+export function reviveImpedanceResult(value) {
+    const record = value;
+    const result = {
+        impedance: {
+            rows: record.impedance.rows,
+            columns: record.impedance.columns,
+            order: "row-major",
+            real: copyFloat64(record.impedance.real, "impedance.real"),
+            imag: copyFloat64(record.impedance.imag, "impedance.imag"),
+        },
+        admittance: {
+            rows: record.admittance.rows,
+            columns: record.admittance.columns,
+            order: "row-major",
+            real: copyFloat64(record.admittance.real, "admittance.real"),
+            imag: copyFloat64(record.admittance.imag, "admittance.imag"),
+        },
+        frequencyMHz: record.frequencyMHz,
+        factorizationGeneration: record.factorizationGeneration,
+    };
+    if (record.conditionEstimate !== undefined) {
+        return { ...result, conditionEstimate: record.conditionEstimate };
+    }
+    return result;
+}
+export function reviveFarFieldResult(value) {
+    const record = value;
+    const result = {
+        ...reviveEvaluation(record.fieldEvaluation),
+        radiusM: record.radiusM,
+        frequencyMHz: record.frequencyMHz,
+        thetaDeg: copyFloat64(record.thetaDeg, "thetaDeg"),
+        phiDeg: copyFloat64(record.phiDeg, "phiDeg"),
+        eThetaReal: copyFloat64(record.eThetaReal, "eThetaReal"),
+        eThetaImag: copyFloat64(record.eThetaImag, "eThetaImag"),
+        ePhiReal: copyFloat64(record.ePhiReal, "ePhiReal"),
+        ePhiImag: copyFloat64(record.ePhiImag, "ePhiImag"),
+    };
+    const fieldBackend = record.fieldBackend === undefined
+        ? undefined
+        : reviveFieldBackendDiagnostics(record.fieldBackend);
+    if (record.diagnostics === undefined) {
+        return fieldBackend === undefined ? result : { ...result, fieldBackend };
+    }
+    const finite = (number, name) => finiteWorkerNumber(number, `diagnostics.${name}`);
+    const diagnostics = record.diagnostics;
+    return {
+        ...result,
+        ...(fieldBackend === undefined ? {} : { fieldBackend }),
+        diagnostics: Object.freeze({
+            instrumentationEnabled: diagnostics.instrumentationEnabled === true,
+            validationMs: finite(diagnostics.validationMs, "validationMs"),
+            wasmCallMs: finite(diagnostics.wasmCallMs, "wasmCallMs"),
+            typescriptExtractionMs: finite(diagnostics.typescriptExtractionMs, "typescriptExtractionMs"),
+            packageTotalMs: finite(diagnostics.packageTotalMs, "packageTotalMs"),
+            native: Object.freeze({
+                validationAllocationMs: finite(diagnostics.native?.validationAllocationMs, "native.validationAllocationMs"),
+                resultReplacementMs: finite(diagnostics.native?.resultReplacementMs, "native.resultReplacementMs"),
+                rawAccumulationMs: finite(diagnostics.native?.rawAccumulationMs, "native.rawAccumulationMs"),
+                derivedRpWorkMs: finite(diagnostics.native?.derivedRpWorkMs, "native.derivedRpWorkMs"),
+                resultCopyMs: finite(diagnostics.native?.resultCopyMs, "native.resultCopyMs"),
+                totalMs: finite(diagnostics.native?.totalMs, "native.totalMs"),
+                abiResultCopyMs: finite(diagnostics.native?.abiResultCopyMs, "native.abiResultCopyMs"),
+                nativeAbiTotalMs: finite(diagnostics.native?.nativeAbiTotalMs, "native.nativeAbiTotalMs"),
+            }),
+            counts: Object.freeze({
+                evaluatedDirections: finite(diagnostics.counts?.evaluatedDirections, "counts.evaluatedDirections"),
+                segments: finite(diagnostics.counts?.segments, "counts.segments"),
+                groundImages: finite(diagnostics.counts?.groundImages, "counts.groundImages"),
+                segmentDirectionContributions: finite(diagnostics.counts?.segmentDirectionContributions, "counts.segmentDirectionContributions"),
+                outputBufferAllocations: finite(diagnostics.counts?.outputBufferAllocations, "counts.outputBufferAllocations"),
+                intermediateBufferAllocations: finite(diagnostics.counts?.intermediateBufferAllocations, "counts.intermediateBufferAllocations"),
+                complexSampleCopies: finite(diagnostics.counts?.complexSampleCopies, "counts.complexSampleCopies"),
+            }),
+        }),
+    };
+}
+export function reviveFieldBackendDiagnostics(value) {
+    const record = value;
+    if (record.backend !== "pending" && record.backend !== "serial"
+        && record.backend !== "worker-pool") {
+        throw new NecRuntimeError("Worker field backend is invalid");
+    }
+    if (record.requestedWorkers !== "auto"
+        && (!Number.isInteger(record.requestedWorkers)
+            || record.requestedWorkers < 1 || record.requestedWorkers > 8)) {
+        throw new NecRuntimeError("Worker field worker selection is invalid");
+    }
+    const number = (entry, name) => {
+        const result = finiteWorkerNumber(entry, `fieldBackend.${name}`);
+        if (result < 0)
+            throw new NecRuntimeError(`Worker fieldBackend.${name} is negative`);
+        return result;
+    };
+    const fallbackReason = record.fallbackReason;
+    if (fallbackReason !== undefined && typeof fallbackReason !== "string") {
+        throw new NecRuntimeError("Worker field fallback reason is invalid");
+    }
+    return Object.freeze({
+        backend: record.backend,
+        requestedWorkers: record.requestedWorkers,
+        activeWorkerCount: number(record.activeWorkerCount, "activeWorkerCount"),
+        tileSize: number(record.tileSize, "tileSize"),
+        totalTiles: number(record.totalTiles, "totalTiles"),
+        completedTiles: number(record.completedTiles, "completedTiles"),
+        cancelledTiles: number(record.cancelledTiles, "cancelledTiles"),
+        cancelledJobs: number(record.cancelledJobs, "cancelledJobs"),
+        restartedWorkers: number(record.restartedWorkers, "restartedWorkers"),
+        snapshotBytesPerWorker: number(record.snapshotBytesPerWorker, "snapshotBytesPerWorker"),
+        lastBroadcastBytesPerWorker: number(record.lastBroadcastBytesPerWorker, "lastBroadcastBytesPerWorker"),
+        resultBytes: number(record.resultBytes, "resultBytes"),
+        geometryReused: record.geometryReused === true,
+        warmupMs: number(record.warmupMs, "warmupMs"),
+        snapshotCaptureMs: number(record.snapshotCaptureMs, "snapshotCaptureMs"),
+        snapshotBroadcastMs: number(record.snapshotBroadcastMs, "snapshotBroadcastMs"),
+        dispatchMs: number(record.dispatchMs, "dispatchMs"),
+        kernelMs: number(record.kernelMs, "kernelMs"),
+        mergeMs: number(record.mergeMs, "mergeMs"),
+        totalMs: number(record.totalMs, "totalMs"),
+        ...(fallbackReason === undefined ? {} : { fallbackReason }),
+    });
+}
+export function reviveEmbeddedFarFieldResult(value) {
+    const record = value;
+    const field = reviveFarFieldResult(record);
+    const normalization = record.normalization.kind === "unit-current"
+        ? Object.freeze({ kind: "unit-current", valueA: 1 })
+        : Object.freeze({ kind: "unit-voltage", valueV: 1 });
+    return {
+        ...field,
+        ports: snapshotPorts(record.ports),
+        normalization,
+        samplesPerPort: record.samplesPerPort,
+    };
+}
+function copyArrayBuffer(value, name) {
+    if (!isArrayBuffer(value)) {
+        throw new NecRuntimeError(`Worker result ${name} is not an ArrayBuffer`);
+    }
+    return value;
+}
+export function revivePreparedTransferHandle(value, name = "handle") {
+    const record = value;
+    if (record === null
+        || typeof record !== "object"
+        || record.schemaVersion !== 1
+        || typeof record.byteLength !== "number"
+        || !Number.isInteger(record.byteLength)
+        || record.byteLength < 0) {
+        throw new NecRuntimeError(`Worker result ${name} is not a transfer handle`);
+    }
+    const buffer = copyArrayBuffer(record.buffer, `${name}.buffer`);
+    if (buffer.byteLength !== record.byteLength) {
+        throw new NecRuntimeError(`Worker result ${name}.byteLength does not match the transferred buffer`);
+    }
+    return {
+        schemaVersion: 1,
+        byteLength: record.byteLength,
+        buffer,
+    };
+}
+export function reviveCurrentDistribution(value) {
+    const record = value;
+    return {
+        schemaVersion: 1,
+        frequencyMHz: finiteWorkerNumber(record.frequencyMHz, "frequencyMHz"),
+        wavelengthM: finiteWorkerNumber(record.wavelengthM, "wavelengthM"),
+        modeKind: record.modeKind,
+        modeCount: record.modeCount,
+        segments: Object.freeze([...(record.segments ?? [])]),
+        startEnds: Object.freeze([...(record.startEnds ?? [])]),
+        endEnds: Object.freeze([...(record.endEnds ?? [])]),
+        centresM: copyFloat64(record.centresM, "centresM"),
+        startsM: copyFloat64(record.startsM, "startsM"),
+        endsM: copyFloat64(record.endsM, "endsM"),
+        tangents: copyFloat64(record.tangents, "tangents"),
+        radiiM: copyFloat64(record.radiiM, "radiiM"),
+        lengthsM: copyFloat64(record.lengthsM, "lengthsM"),
+        aReal: copyFloat64(record.aReal, "aReal"),
+        aImag: copyFloat64(record.aImag, "aImag"),
+        bReal: copyFloat64(record.bReal, "bReal"),
+        bImag: copyFloat64(record.bImag, "bImag"),
+        cReal: copyFloat64(record.cReal, "cReal"),
+        cImag: copyFloat64(record.cImag, "cImag"),
+    };
+}
+export function reviveIsolatedElementCharacterization(value) {
+    const record = value;
+    const impedance = reviveImpedanceResult({
+        impedance: record.impedance,
+        admittance: record.admittance,
+        frequencyMHz: 0,
+        factorizationGeneration: 0,
+    });
+    return {
+        ...reviveEvaluation(record.fieldEvaluation),
+        impedance: impedance.impedance,
+        admittance: impedance.admittance,
+        quadrature: revivePreparedTransferHandle(record.quadrature, "quadrature"),
+        embeddedField: revivePreparedTransferHandle(record.embeddedField, "embeddedField"),
+    };
+}
+export function reviveIsolatedElementHandoff(value) {
+    const record = value;
+    const impedance = reviveImpedanceResult({
+        impedance: record.impedance,
+        admittance: record.admittance,
+        frequencyMHz: 0,
+        factorizationGeneration: 0,
+    });
+    return {
+        ...reviveEvaluation(record.fieldEvaluation),
+        impedance: impedance.impedance,
+        admittance: impedance.admittance,
+        quadratureByteLength: finiteWorkerNumber(record.quadratureByteLength, "quadratureByteLength"),
+        embeddedFieldByteLength: finiteWorkerNumber(record.embeddedFieldByteLength, "embeddedFieldByteLength"),
+    };
+}
+export function cloneFloat64(source) {
+    return Float64Array.from(source);
+}
+export function serializeCreateOptions(options, fieldPool) {
+    if (options === undefined && fieldPool === undefined) {
+        return { transfer: [] };
+    }
+    const payload = {};
+    const transfer = [];
+    if (options?.farFieldEvaluator !== undefined)
+        payload.farFieldEvaluator = selectEvaluator(options.farFieldEvaluator);
+    if (options?.wasmUrl !== undefined && options.wasmBinary !== undefined) {
+        throw new NecInputError("wasmUrl and wasmBinary cannot both be supplied");
+    }
+    if (options?.wasmUrl !== undefined) {
+        payload.wasmUrl = options.wasmUrl instanceof URL
+            ? options.wasmUrl.href
+            : options.wasmUrl;
+    }
+    if (options?.wasmBinary !== undefined) {
+        let bytes;
+        try {
+            if (options.wasmBinary instanceof Uint8Array) {
+                bytes = Uint8Array.from(options.wasmBinary);
+            }
+            else if (options.wasmBinary instanceof ArrayBuffer) {
+                bytes = new Uint8Array(options.wasmBinary.slice(0));
+            }
+            else {
+                throw new TypeError("wasmBinary is not an ArrayBuffer or Uint8Array");
+            }
+        }
+        catch (cause) {
+            throw new NecInputError("wasmBinary must be an ArrayBuffer or Uint8Array with readable WASM bytes", { cause });
+        }
+        payload.wasmBinary = bytes.buffer;
+        transfer.push(bytes.buffer);
+    }
+    if (fieldPool !== undefined) {
+        payload.fieldWorkers = fieldPool.fieldWorkers;
+        if (fieldPool.fieldWorkerAssetBaseUrl !== undefined) {
+            payload.fieldWorkerAssetBaseUrl = fieldPool.fieldWorkerAssetBaseUrl;
+        }
+    }
+    if (payload.wasmUrl === undefined && payload.wasmBinary === undefined
+        && payload.fieldWorkers === undefined && payload.farFieldEvaluator === undefined) {
+        return { transfer };
+    }
+    return { payload, transfer };
+}
+export function toCreateNecModelOptions(options) {
+    if (options === undefined) {
+        return undefined;
+    }
+    if (options.wasmBinary !== undefined) {
+        return { wasmBinary: options.wasmBinary, ...(options.farFieldEvaluator === undefined ? {} : { farFieldEvaluator: selectEvaluator(options.farFieldEvaluator) }) };
+    }
+    if (options.wasmUrl !== undefined) {
+        return { wasmUrl: options.wasmUrl, ...(options.farFieldEvaluator === undefined ? {} : { farFieldEvaluator: selectEvaluator(options.farFieldEvaluator) }) };
+    }
+    return options.farFieldEvaluator === undefined ? undefined : { farFieldEvaluator: selectEvaluator(options.farFieldEvaluator) };
+}

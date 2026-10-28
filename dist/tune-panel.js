@@ -1,0 +1,28 @@
+import {solveKey} from './accurate-panel.js';
+import {formatLength} from './units.js';
+import {formatSWR} from './matching.js';
+const signature=s=>solveKey(s)+'/'+s.matchRatio+'/'+s.referenceZ;
+export function initTune({getState,setState,redraw,notify}){
+ const host=document.createElement('section');host.className='length-tune';document.querySelector('.solve-status').after(host);
+ host.innerHTML=`<div class="tune-actions"><button id="auto-tune" class="button">⌁ Auto tune length</button><label>Search <select id="tune-span"><option value="10">±10% of current length</option><option value="25" selected>±25% of current length</option><option value="50">±50% of current length</option><option value="wide">0.25×–2× current length</option></select></label><label id="tune-l-choice" hidden>Inverted L <select id="tune-l-policy"><option value="rise">Keep vertical rise</option><option value="horizontal">Keep horizontal run</option><option value="scale">Scale both sections</option></select></label><button id="tune-multiband" class="text-button" hidden>Check all bands ↗</button><button id="tune-cancel" class="text-button" hidden>Cancel tuning</button><button id="tune-undo" class="text-button" hidden>Undo length tune</button></div><p class="solve-small" id="tune-note"></p><p id="tune-status" role="status" class="tune-status">Find the lowest modeled SWR within the chosen range, using the selected matching ratio and radio impedance.</p>`;
+ const $=id=>document.getElementById(id);let worker=null,key='',before=null,appliedKey='',lastUnits='';
+ const stop=()=>{worker?.terminate();worker=null;$('auto-tune').disabled=false;$('tune-cancel').hidden=true;};
+ $('tune-cancel').onclick=()=>{stop();$('tune-status').textContent='Tuning canceled. Antenna dimensions unchanged.';};
+ $('auto-tune').onclick=()=>{
+  stop();before=null;$('tune-undo').hidden=true;const s={...getState()},v=$('tune-span').value,min=Math.max(.1,s.length*(v==='wide'?.25:1-Number(v)/100)),max=Math.min(170,s.length*(v==='wide'?2:1+Number(v)/100));key=signature(s);
+  $('auto-tune').disabled=true;$('tune-cancel').hidden=false;$('tune-status').textContent=`Searching ${formatLength(min,s.units)}–${formatLength(max,s.units)} ${s.units}; antenna height and matching ratio stay fixed…`;
+  worker=new Worker(new URL('./length-worker.js',import.meta.url),{type:'module'});
+  worker.onmessage=({data})=>{if(!worker)return;if(data.progress){$('tune-status').textContent=data.progress;return;}if(data.error){stop();$('tune-status').textContent='Could not tune: '+data.error;return;}if(!data.tuned)return;
+   stop();if(signature(getState())!==key){$('tune-status').textContent='Setup changed; tuned dimensions were not applied.';return;}
+   const r=data.tuned,current=getState(),improves=!Number.isFinite(r.before.swr)||r.best.swr<r.before.swr-1e-5;
+   if(improves){before={length:current.length,rise:current.rise,horizontal:current.horizontal,lSolveFor:current.lSolveFor,lLastEdited:current.lLastEdited};const next={...current,length:r.best.state.length,rise:r.best.state.rise,horizontal:r.best.state.horizontal,lSolveFor:r.best.state.lSolveFor,lLastEdited:r.best.state.lLastEdited,solveMode:'accurate'};appliedKey=solveKey(next);setState(next);$('tune-undo').hidden=false;redraw();notify('Tuned length applied. Undo is available below the 3D view.');}
+   $('tune-status').textContent=`${improves?'Applied':'Kept current length; best search result'}: ${formatLength(r.before.length,current.units)} → ${formatLength(r.best.length,current.units)} ${current.units}; SWR ${formatSWR(r.before.swr)} → ${formatSWR(r.best.swr)} at ${current.freq.toFixed(3)} MHz, ${current.matchRatio}:1. ${r.history.length} NEC evaluations.${r.boundary?' Best result is at a search boundary; try a wider range.':''} This is a bounded numerical search, not a guaranteed global minimum.`;
+  };
+  worker.onerror=e=>{stop();$('tune-status').textContent='Tuning could not run: '+e.message;};worker.postMessage({task:'tune',state:s,options:{min,max,lPolicy:$('tune-l-policy').value}});
+ };
+ $('tune-undo').onclick=()=>{if(!before||solveKey(getState())!==appliedKey)return;setState({...getState(),...before});before=null;$('tune-undo').hidden=true;$('tune-status').textContent='Original antenna dimensions restored.';redraw();};
+ for(const id of ['tune-span','tune-l-policy'])$(id).onchange=()=>{if(worker){stop();$('tune-status').textContent='Search settings changed; tuning canceled.';}};
+ return {sync(s){$('tune-multiband').hidden=!['efsloper','efv','invl','monopole'].includes(s.type);if(worker&&signature(s)!==key){stop();$('tune-status').textContent='Setup changed; tuning canceled and dimensions preserved.';}$('tune-l-choice').hidden=s.type!=='invl';if(before&&solveKey(s)!==appliedKey){before=null;$('tune-undo').hidden=true;}if(lastUnits!==s.units&&before){$('tune-status').textContent=`Tuned length ${formatLength(s.length,s.units)} ${s.units}. Undo restores ${formatLength(before.length,s.units)} ${s.units}.`;lastUnits=s.units;}lastUnits=s.units;
+  $('tune-note').textContent=(s.wireIntent==='multiband'&&['efsloper','efv','invl','monopole'].includes(s.type)?'Single-frequency tuning may worsen other bands. Use Random wire for a multiband compromise. ':s.type.startsWith('yagi')?'Preset element lengths scale together; boom spacing stays fixed. ':s.type==='hexbeam'?'The preset wire layout scales together; this is not tuning one commercial Hexbeam band. ':'')+'NEC impedance search; matching ratio, counterpoise / radials, ground and height stay fixed. No external tuner is simulated.';
+ },cancel(){if(worker){stop();$('tune-status').textContent='Tuning canceled. Antenna dimensions unchanged.';}}};
+}

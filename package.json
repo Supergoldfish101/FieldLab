@@ -1,0 +1,1 @@
+{"name":"fieldlab","private":true,"type":"module","scripts":{"test":"node --test","dev":"node server.mjs"}}

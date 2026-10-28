@@ -1,0 +1,11 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {C,DEFAULT,TYPES,sanitize,solve,db,geometry} from '../dist/model.js';
+const lambda=C/14.2,base={...DEFAULT,length:lambda/2};
+test('half-wave free-space dipole agrees with 2.15 dBi reference',()=>{const m=solve({...base,ground:'free'},2);assert.ok(Math.abs(m.gain-2.15)<.025,`gain ${m.gain}`);assert.ok(db(m,90,0)<-70,'wire-axis null');assert.ok(Math.abs(db(m,0,0)-m.gain)<.01);});
+test('quarter-wave monopole at PEC agrees with 5.15 dBi reference',()=>{const m=solve({...base,type:'monopole',height:0,length:lambda/4},2);assert.ok(Math.abs(m.gain-5.15)<.025,`gain ${m.gain}`);assert.ok(Math.abs(db(m,0,0)-db(m,137,0))<1e-8);assert.ok(db(m,0,-5)<-100);});
+test('free-space height translates without changing pattern',()=>{const a=solve({...base,ground:'free',height:3}),b=solve({...base,ground:'free',height:27});assert.ok(Math.abs(a.gain-b.gain)<1e-8);for(const el of [0,15,45,80])assert.ok(Math.abs(db(a,25,el)-db(b,25,el))<1e-8);});
+test('horizontal PEC wire cancels at horizon and changes elevation with height',()=>{const a=solve({...base,height:lambda*.15}),b=solve({...base,height:lambda*.7});assert.ok(db(a,0,0)<-100);assert.notEqual(a.peakEl,b.peakEl);assert.ok(Math.abs(db(a,0,30)-db(b,0,30))>1);});
+test('bearing rotates the horizontal pattern',()=>{const a=solve({...base,ground:'free',bearing:0}),b=solve({...base,ground:'free',bearing:90});assert.ok(Math.abs(db(a,90,20)-db(b,0,20))<1e-8);});
+test('every preset has finite output and physical ground clearance',()=>{for(const type of Object.keys(TYPES)){const s=sanitize({...base,type,length:TYPES[type].ratio*lambda,height:.05});const m=solve(s);assert.ok(Number.isFinite(m.gain)&&m.integral>0,type);for(const p of geometry(s).paths.flatMap(p=>p.points))assert.ok(p[2]>=.04999,type+' ground clearance');}});
+test('import validation clamps malformed inputs',()=>{const s=sanitize({type:'unknown',freq:Infinity,length:-10,height:-20,bearing:800,ground:'ocean'});assert.equal(s.type,'dipole');assert.equal(s.freq,DEFAULT.freq);assert.equal(s.length,.1);assert.equal(s.height,.05);assert.equal(s.bearing,360);assert.equal(s.ground,'perfect');});

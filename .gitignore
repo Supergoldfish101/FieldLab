@@ -1,0 +1,11 @@
+node_modules/
+.openai/
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/
+.DS_Store
+Thumbs.db
+test-results/
+playwright-report/

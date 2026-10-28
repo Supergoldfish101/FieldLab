@@ -1,0 +1,704 @@
+import { selectEvaluator } from "./field-selection.js";
+import { analyzeArraySymmetry, createExplicitArrayBuildPlan, } from "./array-symmetry.js";
+import { NecCancellationError, NecError, NecGeometryError, NecInputError, NecRuntimeError, } from "./errors.js";
+import { createNecArrayWorkerModel } from "./worker-client.js";
+const NEC_VACUUM_PERMITTIVITY_F_PER_M = 8.854e-12;
+const NEC_VACUUM_PERMEABILITY_H_PER_M = 4 * Math.PI * 1e-7;
+const NEC_SPEED_OF_LIGHT_M_PER_S = 1 / Math.sqrt(NEC_VACUUM_PERMITTIVITY_F_PER_M * NEC_VACUUM_PERMEABILITY_H_PER_M);
+const defaultArrayWorkerFactory = createNecArrayWorkerModel;
+async function invoke(value) {
+    return Promise.resolve(value);
+}
+function patternsById(description) {
+    return new Map(description.patterns.map((pattern) => [pattern.id, pattern]));
+}
+function allocateCallerModel(description) {
+    const patterns = patternsById(description);
+    const allocations = [];
+    const ports = [];
+    let nextTag = 1;
+    for (const element of description.elements) {
+        const pattern = patterns.get(element.patternId);
+        if (pattern === undefined) {
+            throw new NecInputError(`Unknown pattern ${element.patternId}`);
+        }
+        const wireTags = new Map();
+        for (const wire of pattern.wires) {
+            wireTags.set(wire.id, nextTag);
+            nextTag += 1;
+        }
+        for (const port of pattern.ports) {
+            const tag = wireTags.get(port.wireId);
+            ports.push(Object.freeze(port.name === undefined
+                ? { tag, segment: port.segment }
+                : { tag, segment: port.segment, name: port.name }));
+        }
+        allocations.push(Object.freeze({ pattern, wireTags }));
+    }
+    return Object.freeze({
+        allocations: Object.freeze(allocations),
+        ports: Object.freeze(ports),
+    });
+}
+function retargetLoad(load, tag) {
+    return {
+        ...load,
+        target: {
+            tag,
+            ...(load.target.firstSegment === undefined
+                ? {}
+                : { firstSegment: load.target.firstSegment }),
+            ...(load.target.lastSegment === undefined
+                ? {}
+                : { lastSegment: load.target.lastSegment }),
+        },
+    };
+}
+async function addElementWires(model, pattern, positionM, wireTags, rotationDeg = 0) {
+    const angle = rotationDeg * Math.PI / 180;
+    const cosine = Math.cos(angle);
+    const sine = Math.sin(angle);
+    const rotate = (x, y) => [
+        cosine * x - sine * y,
+        sine * x + cosine * y,
+    ];
+    for (const wire of pattern.wires) {
+        const start = rotate(wire.startM[0], wire.startM[1]);
+        const end = rotate(wire.endM[0], wire.endM[1]);
+        await invoke(model.addWire({
+            tag: wireTags.get(wire.id),
+            segments: wire.segments,
+            start: [
+                positionM[0] + start[0],
+                positionM[1] + start[1],
+                wire.startM[2],
+            ],
+            end: [
+                positionM[0] + end[0],
+                positionM[1] + end[1],
+                wire.endM[2],
+            ],
+            radiusM: wire.radiusM,
+        }));
+    }
+}
+async function applyExplicit(model, description, plan, caller) {
+    for (let index = 0; index < plan.elements.length; index += 1) {
+        const allocation = caller.allocations[index];
+        await addElementWires(model, allocation.pattern, plan.elements[index].positionM, allocation.wireTags, description.elements[index].rotationDeg ?? 0);
+    }
+    const completion = await invoke(model.completeGeometry({
+        groundConnection: description.groundConnection ?? "none",
+    }));
+    await invoke(model.definePorts(caller.ports));
+    for (const allocation of caller.allocations) {
+        for (const load of allocation.pattern.loads ?? []) {
+            await invoke(model.addLoad(retargetLoad(load, allocation.wireTags.get(load.target.wireId))));
+        }
+    }
+    await invoke(model.setGround(description.ground));
+    return Object.freeze({
+        completion,
+        callerPorts: caller.ports,
+        scatterCallerToNative: Object.freeze(Array.from({ length: caller.ports.length }, (_, index) => index)),
+    });
+}
+async function applySymmetric(model, description, plan, caller) {
+    const patterns = patternsById(description);
+    const fundamentalAllocations = [];
+    let nextTag = 1;
+    for (const element of plan.fundamentalElements) {
+        const pattern = patterns.get(element.patternId);
+        const wireTags = new Map();
+        for (const wire of pattern.wires) {
+            wireTags.set(wire.id, nextTag);
+            nextTag += 1;
+        }
+        fundamentalAllocations.push(Object.freeze({ pattern, wireTags }));
+        await addElementWires(model, pattern, element.positionM, wireTags);
+    }
+    const completion = await invoke(model.completeGeometry({
+        groundConnection: description.groundConnection ?? "none",
+        symmetry: plan.symmetry,
+    }));
+    const nativePorts = [];
+    for (const copy of plan.expansion.copies) {
+        for (const allocation of fundamentalAllocations) {
+            for (const port of allocation.pattern.ports) {
+                const tag = allocation.wireTags.get(port.wireId) + copy.tagOffset;
+                nativePorts.push(port.name === undefined
+                    ? { tag, segment: port.segment }
+                    : { tag, segment: port.segment, name: port.name });
+            }
+        }
+    }
+    await invoke(model.definePorts(nativePorts));
+    // Loads are structural. Expand every fundamental load atomically over all
+    // native copies so prepare never observes an incomplete orbit.
+    for (const copy of plan.expansion.copies) {
+        for (const allocation of fundamentalAllocations) {
+            for (const load of allocation.pattern.loads ?? []) {
+                const tag = allocation.wireTags.get(load.target.wireId) + copy.tagOffset;
+                await invoke(model.addLoad(retargetLoad(load, tag)));
+            }
+        }
+    }
+    await invoke(model.setGround(description.ground));
+    const scatter = new Array(caller.ports.length);
+    for (const mapping of plan.mappings) {
+        for (let portIndex = 0; portIndex < mapping.callerPortIndices.length; portIndex += 1) {
+            scatter[mapping.callerPortIndices[portIndex]] = mapping.generatedPortIndices[portIndex];
+        }
+    }
+    if (scatter.some((index) => !Number.isSafeInteger(index))) {
+        throw new NecGeometryError("Symmetry plan does not map every caller port");
+    }
+    return Object.freeze({
+        completion,
+        callerPorts: caller.ports,
+        scatterCallerToNative: Object.freeze(scatter),
+    });
+}
+/** Apply a validated planner result to either a direct or worker model. */
+export async function applyArrayBuildPlan(model, description, plan) {
+    const caller = allocateCallerModel(description);
+    return plan.kind === "explicit"
+        ? applyExplicit(model, description, plan, caller)
+        : applySymmetric(model, description, plan, caller);
+}
+function validateVector(vector, length) {
+    if (!(vector.real instanceof Float64Array) || !(vector.imag instanceof Float64Array)
+        || vector.real.length !== length || vector.imag.length !== length) {
+        throw new NecInputError(`Complex vector must contain ${length} real and imaginary values`);
+    }
+}
+/** Scatter a caller-order vector into native port order. */
+export function scatterComplexVector(vector, scatterCallerToNative) {
+    validateVector(vector, scatterCallerToNative.length);
+    const real = new Float64Array(scatterCallerToNative.length);
+    const imag = new Float64Array(scatterCallerToNative.length);
+    for (let caller = 0; caller < scatterCallerToNative.length; caller += 1) {
+        const native = scatterCallerToNative[caller];
+        real[native] = vector.real[caller];
+        imag[native] = vector.imag[caller];
+    }
+    return { real, imag };
+}
+/** Gather a native-order vector into caller port order. */
+export function gatherComplexVector(vector, scatterCallerToNative) {
+    validateVector(vector, scatterCallerToNative.length);
+    const real = new Float64Array(scatterCallerToNative.length);
+    const imag = new Float64Array(scatterCallerToNative.length);
+    for (let caller = 0; caller < scatterCallerToNative.length; caller += 1) {
+        const native = scatterCallerToNative[caller];
+        real[caller] = vector.real[native];
+        imag[caller] = vector.imag[native];
+    }
+    return { real, imag };
+}
+/** Gather both dimensions of a native row-major matrix. */
+export function gatherComplexMatrix(matrix, scatterCallerToNative) {
+    const order = scatterCallerToNative.length;
+    if (matrix.rows !== order || matrix.columns !== order
+        || matrix.real.length !== order * order || matrix.imag.length !== order * order) {
+        throw new NecInputError(`Complex matrix must be ${order} by ${order}`);
+    }
+    const real = new Float64Array(order * order);
+    const imag = new Float64Array(order * order);
+    for (let row = 0; row < order; row += 1) {
+        for (let column = 0; column < order; column += 1) {
+            const source = scatterCallerToNative[row] * order + scatterCallerToNative[column];
+            const target = row * order + column;
+            real[target] = matrix.real[source];
+            imag[target] = matrix.imag[source];
+        }
+    }
+    return { rows: order, columns: order, order: "row-major", real, imag };
+}
+/** Gather the basis-major outer port dimension of a field array. */
+export function gatherEmbeddedBasis(values, samplesPerPort, scatterCallerToNative) {
+    if (values.length !== samplesPerPort * scatterCallerToNative.length) {
+        throw new NecInputError("Embedded field array has an invalid basis dimension");
+    }
+    const gathered = new Float64Array(values.length);
+    for (let caller = 0; caller < scatterCallerToNative.length; caller += 1) {
+        const native = scatterCallerToNative[caller];
+        gathered.set(values.subarray(native * samplesPerPort, (native + 1) * samplesPerPort), caller * samplesPerPort);
+    }
+    return gathered;
+}
+function segmentKey(tag, segment) {
+    return `${tag}:${segment}`;
+}
+function remapSegmentEnd(value, nativeTagToCallerTag) {
+    if (value.kind !== "segment") {
+        return Object.freeze({ kind: value.kind });
+    }
+    const tag = nativeTagToCallerTag.get(value.tag);
+    if (tag === undefined) {
+        throw new NecRuntimeError(`Current distribution endpoint references unmapped native tag ${value.tag}`);
+    }
+    return Object.freeze({
+        kind: "segment",
+        tag,
+        segment: value.segment,
+        end: value.end,
+    });
+}
+function gatherSymmetricCurrentDistribution(result, description, plan) {
+    const caller = allocateCallerModel(description);
+    const nativeSegmentByKey = new Map();
+    for (let index = 0; index < result.segments.length; index += 1) {
+        const identity = result.segments[index];
+        nativeSegmentByKey.set(segmentKey(identity.tag, identity.segment), index);
+    }
+    const nativeTagToCallerTag = new Map();
+    for (let callerElementIndex = 0; callerElementIndex < description.elements.length; callerElementIndex += 1) {
+        const mapping = plan.mappings[callerElementIndex];
+        const allocation = caller.allocations[callerElementIndex];
+        for (let wireIndex = 0; wireIndex < allocation.pattern.wires.length; wireIndex += 1) {
+            const wire = allocation.pattern.wires[wireIndex];
+            const nativeTag = mapping.generatedTag + wireIndex;
+            const callerTag = allocation.wireTags.get(wire.id);
+            nativeTagToCallerTag.set(nativeTag, callerTag);
+        }
+    }
+    const sourceIndices = [];
+    const segments = [];
+    for (let callerElementIndex = 0; callerElementIndex < description.elements.length; callerElementIndex += 1) {
+        const mapping = plan.mappings[callerElementIndex];
+        const allocation = caller.allocations[callerElementIndex];
+        for (let wireIndex = 0; wireIndex < allocation.pattern.wires.length; wireIndex += 1) {
+            const wire = allocation.pattern.wires[wireIndex];
+            const nativeTag = mapping.generatedTag + wireIndex;
+            const callerTag = allocation.wireTags.get(wire.id);
+            for (let segment = 1; segment <= wire.segments; segment += 1) {
+                const source = nativeSegmentByKey.get(segmentKey(nativeTag, segment));
+                if (source === undefined) {
+                    throw new NecRuntimeError(`Current distribution is missing native tag ${nativeTag} segment ${segment}`);
+                }
+                sourceIndices.push(source);
+                segments.push(Object.freeze({
+                    tag: callerTag,
+                    segment,
+                    nativeIndex: result.segments[source].nativeIndex,
+                }));
+            }
+        }
+    }
+    if (sourceIndices.length !== result.segments.length) {
+        throw new NecRuntimeError("Current distribution segment count does not match the symmetric array plan");
+    }
+    const gatherScalar = (source) => Float64Array.from(sourceIndices, (index) => source[index]);
+    const gatherTriples = (source, translate) => {
+        const gathered = new Float64Array(3 * sourceIndices.length);
+        for (let target = 0; target < sourceIndices.length; target += 1) {
+            const sourceOffset = 3 * sourceIndices[target];
+            const targetOffset = 3 * target;
+            gathered[targetOffset] = source[sourceOffset] + (translate ? plan.centerM[0] : 0);
+            gathered[targetOffset + 1] = source[sourceOffset + 1]
+                + (translate ? plan.centerM[1] : 0);
+            gathered[targetOffset + 2] = source[sourceOffset + 2];
+        }
+        return gathered;
+    };
+    const gatherPlanes = (source) => {
+        const gathered = new Float64Array(result.modeCount * sourceIndices.length);
+        for (let mode = 0; mode < result.modeCount; mode += 1) {
+            for (let target = 0; target < sourceIndices.length; target += 1) {
+                gathered[mode * sourceIndices.length + target] =
+                    source[mode * result.segments.length + sourceIndices[target]];
+            }
+        }
+        return gathered;
+    };
+    return {
+        schemaVersion: 1,
+        frequencyMHz: result.frequencyMHz,
+        wavelengthM: result.wavelengthM,
+        modeKind: result.modeKind,
+        modeCount: result.modeCount,
+        segments: Object.freeze(segments),
+        startEnds: Object.freeze(sourceIndices.map((source) => remapSegmentEnd(result.startEnds[source], nativeTagToCallerTag))),
+        endEnds: Object.freeze(sourceIndices.map((source) => remapSegmentEnd(result.endEnds[source], nativeTagToCallerTag))),
+        centresM: gatherTriples(result.centresM, true),
+        startsM: gatherTriples(result.startsM, true),
+        endsM: gatherTriples(result.endsM, true),
+        tangents: gatherTriples(result.tangents, false),
+        radiiM: gatherScalar(result.radiiM),
+        lengthsM: gatherScalar(result.lengthsM),
+        aReal: gatherPlanes(result.aReal),
+        aImag: gatherPlanes(result.aImag),
+        bReal: gatherPlanes(result.bReal),
+        bImag: gatherPlanes(result.bImag),
+        cReal: gatherPlanes(result.cReal),
+        cImag: gatherPlanes(result.cImag),
+    };
+}
+function rephaseArrays(result, centerM, basisCount) {
+    const samples = result.thetaDeg.length * result.phiDeg.length;
+    const thetaReal = result.eThetaReal.slice();
+    const thetaImag = result.eThetaImag.slice();
+    const phiReal = result.ePhiReal.slice();
+    const phiImag = result.ePhiImag.slice();
+    if (centerM[0] === 0 && centerM[1] === 0) {
+        return { eThetaReal: thetaReal, eThetaImag: thetaImag, ePhiReal: phiReal, ePhiImag: phiImag };
+    }
+    const waveNumber = 2 * Math.PI * result.frequencyMHz * 1e6 / NEC_SPEED_OF_LIGHT_M_PER_S;
+    for (let basis = 0; basis < basisCount; basis += 1) {
+        for (let phiIndex = 0; phiIndex < result.phiDeg.length; phiIndex += 1) {
+            const phi = result.phiDeg[phiIndex] * Math.PI / 180;
+            for (let thetaIndex = 0; thetaIndex < result.thetaDeg.length; thetaIndex += 1) {
+                const theta = result.thetaDeg[thetaIndex] * Math.PI / 180;
+                const phase = waveNumber * Math.sin(theta)
+                    * (Math.cos(phi) * centerM[0] + Math.sin(phi) * centerM[1]);
+                const cosine = Math.cos(phase);
+                const sine = Math.sin(phase);
+                const index = basis * samples + phiIndex * result.thetaDeg.length + thetaIndex;
+                for (const [real, imag] of [
+                    [thetaReal, thetaImag],
+                    [phiReal, phiImag],
+                ]) {
+                    const originalReal = real[index];
+                    const originalImag = imag[index];
+                    real[index] = originalReal * cosine - originalImag * sine;
+                    imag[index] = originalReal * sine + originalImag * cosine;
+                }
+            }
+        }
+    }
+    return { eThetaReal: thetaReal, eThetaImag: thetaImag, ePhiReal: phiReal, ePhiImag: phiImag };
+}
+/** Restore the far-zone phase removed by centering a symmetric XY model. */
+export function rephaseFarField(result, centerM) {
+    return { ...result, ...rephaseArrays(result, centerM, 1) };
+}
+function failureReason(error) {
+    if (!(error instanceof NecError)) {
+        return undefined;
+    }
+    const value = error.details?.symmetryFailure;
+    return value === "INCOMPATIBLE_GROUND"
+        || value === "INCOMPLETE_LOAD_ORBIT"
+        || value === "UNSUPPORTED_ELEMENT_PATTERN_TRANSFORM"
+        ? value
+        : undefined;
+}
+function retryReason(value) {
+    const code = value === "INCOMPATIBLE_GROUND"
+        ? "GROUND_BREAKS_SYMMETRY"
+        : value === "INCOMPLETE_LOAD_ORBIT"
+            ? "UNSYMMETRIC_LOAD"
+            : "UNSUPPORTED_ELEMENT_PATTERN_TRANSFORM";
+    return Object.freeze({
+        code,
+        message: `Symmetric construction failed with ${value}; rebuilt the unchanged explicit model`,
+    });
+}
+function explicitRetryPlan(description, previous, failure) {
+    const base = createExplicitArrayBuildPlan(description);
+    const reason = retryReason(failure);
+    const reasons = Object.freeze([reason]);
+    const diagnostics = Object.freeze({
+        ...base.diagnostics,
+        candidates: previous.diagnostics.candidates,
+        reasons,
+    });
+    return Object.freeze({ ...base, reasons, diagnostics });
+}
+async function buildWorker(description, plan, fieldWorkers, fieldWorkerAssetBaseUrl, signal, workerFactory = defaultArrayWorkerFactory) {
+    const model = await workerFactory({
+        fieldWorkers,
+        ...(fieldWorkerAssetBaseUrl === undefined ? {} : { fieldWorkerAssetBaseUrl }),
+    }, signal);
+    const abort = () => {
+        model.terminate();
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+        if (signal?.aborted === true) {
+            model.terminate();
+            throw new NecCancellationError("aborted");
+        }
+        return { model, application: await applyArrayBuildPlan(model, description, plan) };
+    }
+    catch (error) {
+        await model.dispose();
+        if (signal?.aborted === true && error instanceof NecCancellationError) {
+            throw new NecCancellationError("aborted");
+        }
+        throw error;
+    }
+    finally {
+        signal?.removeEventListener("abort", abort);
+    }
+}
+class WorkerNecArraySolver {
+    #model;
+    #plan;
+    #application;
+    #description;
+    #mode;
+    #fieldWorkers;
+    #fieldWorkerAssetBaseUrl;
+    #workerFactory;
+    #evaluator;
+    #fieldDiagnostics;
+    #retried = false;
+    #terminated = false;
+    #terminationController = new AbortController();
+    constructor(model, description, plan, application, mode, fieldWorkers, fieldWorkerAssetBaseUrl, workerFactory = defaultArrayWorkerFactory, evaluator = "exact") {
+        this.#evaluator = selectEvaluator(evaluator);
+        this.#model = model;
+        this.#description = description;
+        this.#plan = plan;
+        this.#application = application;
+        this.#mode = mode;
+        this.#fieldWorkers = fieldWorkers;
+        this.#fieldWorkerAssetBaseUrl = fieldWorkerAssetBaseUrl;
+        this.#workerFactory = workerFactory;
+        this.#fieldDiagnostics = pendingFieldDiagnostics(fieldWorkers);
+    }
+    get state() {
+        return this.#model.state;
+    }
+    async prepare(options) {
+        try {
+            await this.#model.prepare(options);
+        }
+        catch (error) {
+            if (this.#terminated && error instanceof NecCancellationError) {
+                throw new NecCancellationError("terminated");
+            }
+            const failure = failureReason(error);
+            if (this.#mode !== "auto" || this.#plan.kind !== "symmetric"
+                || this.#retried || failure === undefined) {
+                throw error;
+            }
+            this.#retried = true;
+            await this.#model.dispose();
+            const retryPlan = explicitRetryPlan(this.#description, this.#plan, failure);
+            let built;
+            try {
+                built = await buildWorker(this.#description, retryPlan, this.#fieldWorkers, this.#fieldWorkerAssetBaseUrl, this.#terminationController.signal, this.#workerFactory);
+            }
+            catch (retryError) {
+                if (this.#terminated && retryError instanceof NecCancellationError) {
+                    throw new NecCancellationError("terminated");
+                }
+                throw retryError;
+            }
+            if (this.#terminated) {
+                built.model.terminate();
+                throw new NecCancellationError("terminated");
+            }
+            this.#model = built.model;
+            this.#plan = retryPlan;
+            this.#application = built.application;
+            await this.#model.prepare(options);
+        }
+    }
+    async computeImpedanceMatrix() {
+        const result = await this.#model.computeImpedanceMatrix();
+        const scatter = this.#application.scatterCallerToNative;
+        return {
+            impedance: gatherComplexMatrix(result.impedance, scatter),
+            admittance: gatherComplexMatrix(result.admittance, scatter),
+            ...(result.conditionEstimate === undefined ? {} : { conditionEstimate: result.conditionEstimate }),
+            frequencyMHz: result.frequencyMHz,
+            factorizationGeneration: result.factorizationGeneration,
+        };
+    }
+    async #solve(drive, vector) {
+        const scatter = this.#application.scatterCallerToNative;
+        const nativeVector = scatterComplexVector(vector, scatter);
+        const result = drive === "voltage"
+            ? await this.#model.solveVoltages(nativeVector)
+            : await this.#model.solveCurrents(nativeVector);
+        const powersW = new Float64Array(scatter.length);
+        for (let caller = 0; caller < scatter.length; caller += 1) {
+            powersW[caller] = result.powersW[scatter[caller]];
+        }
+        return {
+            drive: result.drive,
+            frequencyMHz: result.frequencyMHz,
+            ports: this.#application.callerPorts,
+            requested: gatherComplexVector(result.requested, scatter),
+            voltages: gatherComplexVector(result.voltages, scatter),
+            currents: gatherComplexVector(result.currents, scatter),
+            activeImpedances: gatherComplexVector(result.activeImpedances, scatter),
+            powersW,
+            powerBudget: result.powerBudget,
+            factorizationGeneration: result.factorizationGeneration,
+            solveGeneration: result.solveGeneration,
+        };
+    }
+    solveVoltages(voltages) {
+        return this.#solve("voltage", voltages);
+    }
+    solveCurrents(currents) {
+        return this.#solve("current", currents);
+    }
+    async getCurrentDistribution(options) {
+        if (typeof options !== "object" || options === null
+            || options.kind !== "latest-solution") {
+            throw new NecInputError("options.kind must be latest-solution");
+        }
+        const result = await this.#model.getCurrentDistribution(options);
+        return this.#plan.kind === "explicit"
+            ? result
+            : gatherSymmetricCurrentDistribution(result, this.#description, this.#plan);
+    }
+    async computeFarField(request) {
+        const result = await this.#model.computeFarField({ ...request, evaluator: selectEvaluator(request?.evaluator, this.#evaluator) });
+        if (result.fieldBackend !== undefined) {
+            this.#fieldDiagnostics = result.fieldBackend;
+        }
+        const center = this.#plan.kind === "symmetric" ? this.#plan.centerM : [0, 0];
+        return rephaseFarField(result, center);
+    }
+    async computeEmbeddedFarFields(request, normalization) {
+        const result = await this.#model.computeEmbeddedFarFields({ ...request, evaluator: selectEvaluator(request?.evaluator, this.#evaluator) }, normalization);
+        const scatter = this.#application.scatterCallerToNative;
+        const gathered = {
+            ...result,
+            ports: this.#application.callerPorts,
+            eThetaReal: gatherEmbeddedBasis(result.eThetaReal, result.samplesPerPort, scatter),
+            eThetaImag: gatherEmbeddedBasis(result.eThetaImag, result.samplesPerPort, scatter),
+            ePhiReal: gatherEmbeddedBasis(result.ePhiReal, result.samplesPerPort, scatter),
+            ePhiImag: gatherEmbeddedBasis(result.ePhiImag, result.samplesPerPort, scatter),
+        };
+        const center = this.#plan.kind === "symmetric" ? this.#plan.centerM : [0, 0];
+        return { ...gathered, ...rephaseArrays(gathered, center, scatter.length) };
+    }
+    cancelFarField() {
+        this.#model.cancelFarField();
+    }
+    terminate() {
+        if (this.#terminated)
+            return;
+        this.#terminated = true;
+        this.#terminationController.abort();
+        this.#model.terminate();
+    }
+    dispose() {
+        return this.#model.dispose();
+    }
+    getDiagnostics() {
+        return Object.freeze({
+            representation: this.#plan.kind,
+            planner: this.#plan.diagnostics,
+            ...(this.#application.completion.symmetry === undefined
+                ? {}
+                : { symmetry: this.#application.completion.symmetry }),
+            field: this.#fieldDiagnostics,
+        });
+    }
+}
+function pendingFieldDiagnostics(requestedWorkers) {
+    return Object.freeze({
+        backend: "pending",
+        requestedWorkers,
+        activeWorkerCount: 0,
+        tileSize: 512,
+        totalTiles: 0,
+        completedTiles: 0,
+        cancelledTiles: 0,
+        cancelledJobs: 0,
+        restartedWorkers: 0,
+        snapshotBytesPerWorker: 0,
+        lastBroadcastBytesPerWorker: 0,
+        resultBytes: 0,
+        geometryReused: false,
+        warmupMs: 0,
+        snapshotCaptureMs: 0,
+        snapshotBroadcastMs: 0,
+        dispatchMs: 0,
+        kernelMs: 0,
+        mergeMs: 0,
+        totalMs: 0,
+    });
+}
+function resolveFieldAssetBase(value) {
+    if (value === undefined)
+        return undefined;
+    if (!(typeof value === "string" || value instanceof URL)
+        || (typeof value === "string" && value.trim().length === 0)) {
+        throw new NecInputError("fieldWorkerAssetBaseUrl must be a nonempty string or URL");
+    }
+    try {
+        const resolved = value instanceof URL
+            ? new URL(value.href)
+            : new URL(value, import.meta.url);
+        if (!resolved.pathname.endsWith("/"))
+            resolved.pathname += "/";
+        return resolved.href;
+    }
+    catch (cause) {
+        throw new NecInputError("fieldWorkerAssetBaseUrl is not a valid URL", { cause });
+    }
+}
+function validateAbortSignal(signal) {
+    if (signal !== undefined
+        && (typeof signal !== "object"
+            || typeof signal.aborted !== "boolean"
+            || typeof signal.addEventListener !== "function"
+            || typeof signal.removeEventListener !== "function")) {
+        throw new NecInputError("signal must be an AbortSignal");
+    }
+}
+function isAborted(signal) {
+    return signal?.aborted === true;
+}
+/** Create one asynchronous solver facade for explicit and symmetric arrays. */
+export async function createNecArraySolver(description, options = {}) {
+    return createNecArraySolverWithWorkerFactory(description, options, defaultArrayWorkerFactory);
+}
+/** @internal Test seam for deterministic worker lifecycle verification. */
+export async function createNecArraySolverWithWorkerFactory(description, options, workerFactory) {
+    if (typeof options !== "object" || options === null) {
+        throw new NecInputError("Array solver options must be an object");
+    }
+    const evaluator = selectEvaluator(options.farFieldEvaluator);
+    validateAbortSignal(options.signal);
+    if (isAborted(options.signal)) {
+        throw new NecCancellationError("aborted");
+    }
+    const mode = options.symmetry ?? "auto";
+    if (mode !== "auto" && mode !== "off" && mode !== "require") {
+        throw new NecInputError("Unknown array symmetry mode", { details: { mode } });
+    }
+    if (mode !== "off" && options.symmetrizer === undefined) {
+        throw new NecInputError("Automatic array symmetry requires an explicit symmetrizer.positionEpsilonM");
+    }
+    const fieldWorkers = options.fieldWorkers ?? "auto";
+    if (fieldWorkers !== "auto"
+        && (!Number.isInteger(fieldWorkers) || fieldWorkers < 1 || fieldWorkers > 8)) {
+        throw new NecInputError("fieldWorkers must be \"auto\" or an integer from 1 through 8");
+    }
+    const fieldWorkerAssetBaseUrl = resolveFieldAssetBase(options.fieldWorkerAssetBaseUrl);
+    let plan = mode === "off"
+        ? createExplicitArrayBuildPlan(description)
+        : analyzeArraySymmetry(description, options.symmetrizer);
+    if (isAborted(options.signal)) {
+        throw new NecCancellationError("aborted");
+    }
+    if (mode === "require" && plan.kind !== "symmetric") {
+        throw new NecGeometryError("The array cannot be represented by supported symmetry", {
+            details: { reasons: plan.reasons },
+        });
+    }
+    try {
+        const built = await buildWorker(description, plan, fieldWorkers, fieldWorkerAssetBaseUrl, options.signal, workerFactory);
+        return new WorkerNecArraySolver(built.model, description, plan, built.application, mode, fieldWorkers, fieldWorkerAssetBaseUrl, workerFactory, evaluator);
+    }
+    catch (error) {
+        const failure = failureReason(error);
+        if (mode !== "auto" || plan.kind !== "symmetric" || failure === undefined) {
+            throw error;
+        }
+        plan = explicitRetryPlan(description, plan, failure);
+        const built = await buildWorker(description, plan, fieldWorkers, fieldWorkerAssetBaseUrl, options.signal, workerFactory);
+        return new WorkerNecArraySolver(built.model, description, plan, built.application, mode, fieldWorkers, fieldWorkerAssetBaseUrl, workerFactory, evaluator);
+    }
+}

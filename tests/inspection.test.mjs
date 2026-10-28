@@ -1,0 +1,12 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {cutDirection,cutPoint} from '../dist/inspection.js';
+import {DEFAULT,C,TYPES,sanitize,geometry,solve,db} from '../dist/model.js';
+const near=(a,b)=>assert.ok(Math.abs(a-b)<1e-7,`${a} != ${b}`);
+test('elevation cursor maps right, zenith and opposite horizon correctly',()=>{assert.deepEqual(cutDirection('elevation',219,125,30),{az:30,el:0});assert.deepEqual(cutDirection('elevation',120,26,30),{az:30,el:90});assert.deepEqual(cutDirection('elevation',21,125,30),{az:210,el:0});});
+test('azimuth cursor maps cardinal directions and selected elevation',()=>{for(const a of [0,90,180,270,359]){const p=cutPoint('azimuth',a,.7),d=cutDirection('azimuth',p.x,p.y,0,35);near(d.az,a);near(d.el,35);}});
+test('elevation pattern marker round-trips both half-cuts',()=>{for(const a of [5,45,89,91,135,175]){const p=cutPoint('elevation',a,.8),d=cutDirection('elevation',p.x,p.y,350);near(d.az,a<=90?350:170);near(d.el,a<=90?a:180-a);}});
+test('inverted L dimensions preserve vertical rise and horizontal run',()=>{const s=sanitize({...DEFAULT,type:'invl',height:2,rise:7,horizontal:12}),g=geometry(s);assert.equal(s.length,19);near(g.paths[0].points[1][2],9);near(g.paths[0].points[2][2],9);near(Math.hypot(g.paths[0].points[2][0]-g.paths[0].points[1][0],g.paths[0].points[2][1]-g.paths[0].points[1][1]),12);});
+test('upright V has two tips above its feed and end-fed sloper starts low',()=>{const v=geometry(sanitize({...DEFAULT,type:'uprightv'}));assert.ok(v.paths[0].points[0][2]>v.feed[2]);assert.ok(v.paths[0].points.at(-1)[2]>v.feed[2]);const s=geometry(sanitize({...DEFAULT,type:'efsloper'}));near(s.feed[2],DEFAULT.height);assert.ok(s.paths[0].points[1][2]>s.feed[2]);});
+test('Yagi templates have correct element counts and forward boom bearing',()=>{for(const type of ['yagi3','yagi5']){const s=sanitize({...DEFAULT,type,bearing:40,ground:'free',length:C/DEFAULT.freq/2}),m=solve(s);assert.equal(m.paths.length,type==='yagi3'?3:5);assert.ok(db(m,40,0)>db(m,220,0)+5);assert.ok(Math.abs(m.peakAz-40)<=5);}});
+test('all 15 presets produce portable state and finite models',()=>{assert.equal(Object.keys(TYPES).length,15);for(const type of Object.keys(TYPES)){const s=sanitize({...DEFAULT,type,length:TYPES[type].ratio*C/DEFAULT.freq}),m=solve(s);assert.deepEqual(sanitize(JSON.parse(JSON.stringify(s))),s);assert.ok(Number.isFinite(m.gain),type);}});

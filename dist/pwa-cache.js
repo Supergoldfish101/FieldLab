@@ -1,0 +1,4 @@
+export async function isAppShell(response){return !!response&&response.ok&&!response.redirected&&(response.headers.get('content-type')||'').includes('text/html')&&(await response.clone().text()).includes('data-fieldlab-shell="1"');}
+export async function cleanResponse(response){return new Response(await response.clone().arrayBuffer(),{status:response.status,statusText:response.statusText,headers:response.headers});}
+// Verify online access, but keep each app version's cached shell and assets together.
+export async function navigateWithOfflineShell(network,cached){try{const response=await network();if(await isAppShell(response))return cached||await cleanResponse(response);return response;}catch{if(cached)return cached;return new Response('FieldLab is not available offline yet. Open it online once and wait for Offline ready.',{status:503,headers:{'content-type':'text/plain'}});}}
